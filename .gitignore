@@ -1,0 +1,16 @@
+# Build outputs (shipped via GitHub Releases, not git)
+dist/
+app/.build/
+.build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Local test scratch (never commit)
+/tmp/

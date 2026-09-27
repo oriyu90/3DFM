@@ -1,0 +1,18 @@
+# torch runtime for trellis / hun-human venvs (macOS arm64, MPS).
+# Pinned per 計画書 §2; Metal extension ports (mtlgemm/mtldiffrast/...)
+# are added in P1 by setup phase extension (see scripts/setup.sh).
+torch==2.13.0
+torchvision==0.28.0
+pillow
+trimesh
+scipy
+xatlas
+fast_simplification
+opencv-python
+transformers
+safetensors
+huggingface-hub
+einops
+kornia
+timm
+scikit-image

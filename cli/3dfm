@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""3dfm CLI: thin REST client over the 3DFM local server (stdlib only).
+
+Every command maps 1:1 to a REST call; the CLI never runs inference itself.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+def data_dir() -> Path:
+    o = os.environ.get("FM3D_DATA_DIR")
+    return Path(o).expanduser() if o else \
+        Path.home() / "Library" / "Application Support" / "3DFM"
+
+
+def token() -> str:
+    p = data_dir() / "server.token"
+    try:
+        return p.read_text().strip()
+    except OSError:
+        sys.exit("server token not found (is the app running?)")
+
+
+def find_port() -> int:
+    if os.environ.get("FM3D_PORT"):
+        return int(os.environ["FM3D_PORT"])
+    for port in range(44931, 44941):
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=1) as r:
+                if r.status == 200:
+                    return port
+        except OSError:
+            continue
+    sys.exit("3DFM server not reachable (launch the app or `3dfm serve`)")
+
+
+class API:
+    def __init__(self):
+        self.base = f"http://127.0.0.1:{find_port()}"
+        self.tok = token()
+
+    def req(self, method: str, path: str, body=None, raw: bool = False):
+        data = None
+        headers = {"Authorization": f"Bearer {self.tok}"}
+        if body is not None and not raw:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        elif raw is not None and raw is not False and body is not None:
+            data = body
+        r = urllib.request.Request(self.base + path, data=data,
+                                   headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                out = resp.read()
+                try:
+                    return json.loads(out)
+                except ValueError:
+                    return out
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read()).get("detail", e.reason)
+            except ValueError:
+                detail = e.reason
+            sys.exit(f"error {e.code}: {detail}")
+
+    def upload(self, path: str, spec: dict, files: list[str]):
+        boundary = "3dfmboundary7d"
+        buf = bytearray()
+        part = (f"--{boundary}\r\nContent-Disposition: form-data; "
+                f'name="spec"\r\n\r\n{json.dumps(spec)}\r\n').encode()
+        buf += part
+        for f in files:
+            p = Path(f)
+            buf += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                    f'name="images"; filename="{p.name}"\r\n'
+                    "Content-Type: application/octet-stream\r\n\r\n").encode()
+            buf += p.read_bytes() + b"\r\n"
+        buf += f"--{boundary}--\r\n".encode()
+        headers = {"Authorization": f"Bearer {self.tok}",
+                   "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        r = urllib.request.Request(self.base + path, data=bytes(buf),
+                                   headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read()).get("detail", e.reason)
+            except ValueError:
+                detail = e.reason
+            sys.exit(f"error {e.code}: {detail}")
+
+
+def cmd_status(a: API, _):
+    print(json.dumps(a.req("GET", "/health"), indent=2, ensure_ascii=False))
+    print(json.dumps(a.req("GET", "/models/status"),
+                     indent=2, ensure_ascii=False))
+
+
+def cmd_submit(a: API, args):
+    import argparse
+    p = argparse.ArgumentParser(prog="3dfm submit")
+    p.add_argument("--mode", default="normal")
+    p.add_argument("-i", "--image", action="append", default=[])
+    p.add_argument("--name", default="job")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--texture-size", type=int, default=2048)
+    p.add_argument("--pipeline-type", default="512->1024")
+    p.add_argument("--synthesize-views", action="store_true")
+    p.add_argument("--duration-s", type=float, default=None)  # test backend
+    p.add_argument("--fail-at", default=None)                 # test backend
+    ns = p.parse_args(args)
+    spec = {"mode": ns.mode, "name": ns.name, "seed": ns.seed,
+            "texture_size": ns.texture_size,
+            "pipeline_type": ns.pipeline_type,
+            "synthesize_views": ns.synthesize_views}
+    if ns.duration_s is not None:
+        spec["duration_s"] = ns.duration_s
+    if ns.fail_at is not None:
+        spec["fail_at"] = ns.fail_at
+    print(json.dumps(a.upload("/jobs", spec, ns.image), ensure_ascii=False))
+
+
+def cmd_list(a: API, args):
+    state = args[0] if args else None
+    q = f"?state={urllib.parse.quote(state)}" if state else ""
+    for j in a.req("GET", "/jobs" + q)["jobs"]:
+        print(f"{j['id']}  {j['state']:9s} {j['progress']:5.1f}%  "
+              f"{j['stage']}  {j['name']}")
+
+
+def cmd_show(a: API, args):
+    follow = "--follow" in args
+    jid = [x for x in args if not x.startswith("--")][0]
+    while True:
+        j = a.req("GET", f"/jobs/{jid}")
+        print(f"{j['state']} {j['progress']:.1f}% [{j['stage']}] "
+              f"eta={j['eta_s']} err={j['error']}")
+        if not follow or j["state"] not in ("queued", "running"):
+            break
+        time.sleep(1)
+
+
+def cmd_cancel(a: API, args):
+    force = "--force" in args
+    jid = [x for x in args if not x.startswith("--")][0]
+    q = "?force=true" if force else ""
+    print(a.req("DELETE", f"/jobs/{jid}" + q))
+
+
+def cmd_retry(a: API, args):
+    print(json.dumps(a.req("POST", f"/jobs/{args[0]}/retry"),
+                     ensure_ascii=False))
+
+
+def cmd_log(a: API, args):
+    jid = args[0]
+    print(a.req("GET", f"/jobs/{jid}/log?tail=200")["log"])
+
+
+def cmd_open(a: API, args):
+    j = a.req("GET", f"/jobs/{args[0]}")
+    arts = a.req("GET", f"/jobs/{args[0]}/artifacts")["artifacts"]
+    glbs = [x for x in arts if x["path"].endswith(".glb")]
+    target = glbs[0]["path"] if glbs else None
+    d = data_dir() / "jobs" / args[0]
+    subprocess.run(["open", str(d)], check=False)
+
+
+def cmd_models(a: API, _):
+    print(json.dumps(a.req("GET", "/models/status"),
+                     indent=2, ensure_ascii=False))
+
+
+def cmd_settings(a: API, args):
+    if not args or args[0] == "get":
+        print(json.dumps(a.req("GET", "/settings"),
+                         indent=2, ensure_ascii=False))
+    elif args[0] == "set" and len(args) == 3:
+        k, v = args[1], args[2]
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+        print(json.dumps(a.req("PUT", "/settings", {k: v}),
+                         indent=2, ensure_ascii=False))
+    else:
+        sys.exit("usage: 3dfm settings [get|set <key> <json-value>]")
+
+
+def cmd_serve(_a, args):
+    headless = "--headless" in args
+    src = Path(__file__).resolve().parent.parent / "server" / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(src) + os.pathsep + env.get("PYTHONPATH", "")
+    py = sys.executable
+    cmd = [py, "-m", "fm3d.main"]
+    if headless or os.environ.get("FM3D_DETACH") == "1":
+        subprocess.Popen(cmd, env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print("server started (detached)")
+    else:
+        os.execvpe(py, cmd, env)
+
+
+COMMANDS = {"status": cmd_status, "submit": cmd_submit, "list": cmd_list,
+            "show": cmd_show, "cancel": cmd_cancel, "retry": cmd_retry,
+            "log": cmd_log, "open": cmd_open, "models": cmd_models,
+            "settings": cmd_settings, "serve": cmd_serve}
+
+
+def main() -> None:
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.exit("usage: 3dfm {" + "|".join(COMMANDS) + "}")
+    cmd = COMMANDS[sys.argv[1]]
+    api = None if sys.argv[1] == "serve" else API()
+    cmd(api, sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

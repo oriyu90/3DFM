@@ -1,0 +1,32 @@
+# torch + MLX runtime for the hun-human venv (macOS arm64).
+# Same torch pin as requirements-torch.txt plus MLX + diffusion extras.
+torch==2.13.0
+torchvision==0.28.0
+mlx
+pillow
+kornia
+timm
+trimesh
+scipy
+xatlas
+fast_simplification
+opencv-python
+transformers>=4.57
+diffusers>=0.40.0
+accelerate==1.1.1
+peft
+safetensors
+huggingface-hub
+einops
+rembg==2.0.65
+realesrgan==0.3.0
+basicsr==1.4.2
+scikit-image
+pygltflib
+open3d
+pyyaml
+omegaconf
+tqdm
+psutil
+controlnet_aux
+sentencepiece
