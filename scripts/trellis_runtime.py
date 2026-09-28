@@ -116,6 +116,9 @@ def main() -> int:
 
     # -- python deps ----------------------------------------------------
     upip(venv_py, str(deps / "utils3d"))
+    # TRELLIS.2 pipeline imports (trellis2.pipelines.samplers needs it;
+    # missing on fresh venvs -> "No module named 'easydict'" at shape stage).
+    upip(venv_py, "easydict")
 
     metal_ok = False
     skip_marker = tm / ".skip-metal"
