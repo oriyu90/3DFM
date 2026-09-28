@@ -24,7 +24,8 @@ cp "$ROOT/server"/requirements-*.txt "$APP/Contents/Resources/server/"
 cp "$ROOT/cli/3dfm" "$APP/Contents/Resources/cli/3dfm"
 chmod +x "$APP/Contents/Resources/cli/3dfm"
 cp "$ROOT/scripts/setup.sh" "$ROOT/scripts/probe.py" \
-   "$ROOT/scripts/fetch_models.py" "$ROOT/scripts/trellis_runtime.py" \
+   "$ROOT/scripts/fetch_models.py" "$ROOT/scripts/prune_models.py" \
+   "$ROOT/scripts/trellis_runtime.py" \
    "$ROOT/scripts/hun_runtime.py" "$ROOT/scripts/mv_runtime.py" \
    "$APP/Contents/Resources/scripts/"
 chmod +x "$APP/Contents/Resources/scripts/setup.sh"

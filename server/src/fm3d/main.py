@@ -350,12 +350,14 @@ def _has_mps() -> bool:
 
 
 def _manifest() -> list[dict]:
+    # expected_gb tracks the *slim* layout (fetch allow_patterns +
+    # prune_models.py): fp32 safetensors only, no framework duplicates.
     return [
-        {"id": "rmbg-2.0", "dir": "rmbg-2.0", "gb": 0.7},
+        {"id": "rmbg-2.0", "dir": "rmbg-2.0", "gb": 0.9},
         {"id": "trellis-2-4b", "dir": "trellis-2-4b", "gb": 15},
         {"id": "hunyuan3d-2.1-mlx", "dir": "hunyuan3d-2.1-mlx", "gb": 14},
-        {"id": "sdxl-base-1.0", "dir": "sdxl-base-1.0", "gb": 7},
-        {"id": "mv-adapter", "dir": "mv-adapter", "gb": 1.5},
+        {"id": "sdxl-base-1.0", "dir": "sdxl-base-1.0", "gb": 13},
+        {"id": "mv-adapter", "dir": "mv-adapter", "gb": 3.5},
         {"id": "realesrgan", "dir": "realesrgan", "gb": 0.06},
     ]
 

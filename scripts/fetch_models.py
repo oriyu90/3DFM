@@ -22,20 +22,41 @@ from pathlib import Path
 
 TIERS: dict[str, list[dict]] = {
     "normal": [
-        {"id": "rmbg-2.0", "repo": "briaai/RMBG-2.0", "gated": True},
+        {"id": "rmbg-2.0", "repo": "briaai/RMBG-2.0", "gated": True,
+         "allow": ["*.json", "*.py", "*.md", ".gitattributes",
+                   "model.safetensors", "preprocessor_config.json"]},
         {"id": "trellis-2-4b", "repo": "microsoft/TRELLIS.2-4B",
          "gated": False},
     ],
     "human": [
-        {"id": "rmbg-2.0", "repo": "briaai/RMBG-2.0", "gated": True},
+        {"id": "rmbg-2.0", "repo": "briaai/RMBG-2.0", "gated": True,
+         "allow": ["*.json", "*.py", "*.md", ".gitattributes",
+                   "model.safetensors", "preprocessor_config.json"]},
         {"id": "trellis-2-4b", "repo": "microsoft/TRELLIS.2-4B",
          "gated": False},
         {"id": "hunyuan3d-2.1-mlx", "repo": "dgrauet/hunyuan3d-2.1-mlx",
          "gated": False},
         {"id": "sdxl-base-1.0",
          "repo": "stabilityai/stable-diffusion-xl-base-1.0",
-         "gated": False},
-        {"id": "mv-adapter", "repo": "huanngzh/mv-adapter", "gated": False},
+         "gated": False,
+         # Slim set: exactly what MVAdapterI2MVSDXLPipeline.from_pretrained
+         # resolves (model_index.json's 7 components, fp32 safetensors).
+         # Skips flax/onnx/openvino duplicates, fp16 copies, single-file
+         # checkpoints and standalone vae_* dirs (~59 GB saved).
+         "allow": ["model_index.json", "*.md",
+                   "scheduler/*", "tokenizer/*", "tokenizer_2/*",
+                   "text_encoder/config.json",
+                   "text_encoder/model.safetensors",
+                   "text_encoder_2/config.json",
+                   "text_encoder_2/model.safetensors",
+                   "unet/config.json",
+                   "unet/diffusion_pytorch_model.safetensors",
+                   "vae/config.json",
+                   "vae/diffusion_pytorch_model.safetensors"]},
+        {"id": "mv-adapter", "repo": "huanngzh/mv-adapter", "gated": False,
+         # Only the adapter the code loads (backends checks this exact
+         # file). Other task variants + SD2.1 files are unused.
+         "allow": ["*.md", "mvadapter_i2mv_sdxl.safetensors"]},
         {"id": "realesrgan",
          "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/"
                 "v0.1.0/RealESRGAN_x4plus.pth",
@@ -45,11 +66,14 @@ TIERS: dict[str, list[dict]] = {
 TIERS["full"] = TIERS["human"]
 
 
-def snapshot(repo: str, dest: Path) -> None:
+def snapshot(repo: str, dest: Path, allow: list[str] | None = None) -> None:
     from huggingface_hub import snapshot_download
     dest.mkdir(parents=True, exist_ok=True)
-    snapshot_download(repo_id=repo, local_dir=str(dest),
-                      local_dir_use_symlinks=False, resume_download=True)
+    kw: dict = {"repo_id": repo, "local_dir": str(dest),
+                "local_dir_use_symlinks": False, "resume_download": True}
+    if allow:
+        kw["allow_patterns"] = allow
+    snapshot_download(**kw)
 
 
 def fetch_url(url: str, dest: Path) -> None:
@@ -122,9 +146,12 @@ def main() -> int:
             continue
         # Always run snapshot_download(): it resumes partial downloads
         # and is a cheap no-op when complete. Never skip on listing alone.
+        # NOTE: allow_patterns only restricts what is *fetched*; files
+        # already on disk from an older full snapshot are left alone.
+        # Use scripts/prune_models.py to slim an existing install.
         try:
             print(f"download {it['repo']} -> {it['id']} ...")
-            snapshot(it["repo"], dest)
+            snapshot(it["repo"], dest, it.get("allow"))
             manifest[it["id"]] = {"status": "ok", "repo": it["repo"]}
             ok.append(it["id"])
         except Exception as e:  # noqa: BLE001 - record and continue

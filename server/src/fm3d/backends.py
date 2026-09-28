@@ -590,22 +590,45 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
             _sys2.modules["nvdiffrast"] = _fake
             _sys2.modules["nvdiffrast.torch"] = _fake_torch
     # Same story for triton (only used by the texture-blend path).
+    # It must look like a *package*: torch._inductor.runtime.hints does
+    # `import triton.backends.compiler` behind has_triton_package(), and a
+    # flat module stub dies with "'triton' is not a package" (fatal inside
+    # diffusers' peft loader import). Empty submodules land torch in its
+    # pure-python AttrsDescriptor fallback, which our path never executes.
     if "triton" not in _sys2.modules:
         try:
             import triton  # noqa: F401
         except ImportError:
             _tr = _types.ModuleType("triton")
+            _tr.__path__ = []
             # @triton.jit is evaluated at import time; identity is fine
             # since the kernel is never launched on our code path.
             _tr.jit = lambda f=None, **kw: (f if callable(f)
                                             else (lambda g: g))
             _tl = _types.ModuleType("triton.language")
+            _tl.__path__ = []
             _tl.dtype = type("dtype", (), {})
             _tl.constexpr = lambda f=None, **kw: (f if callable(f)
                                                   else (lambda g: g))
             _tr.language = _tl
+            _bc = _types.ModuleType("triton.backends")
+            _bc.__path__ = []
+            _bcc = _types.ModuleType("triton.backends.compiler")
+            _bcc.__path__ = []
+            _bc.compiler = _bcc
+            _tr.backends = _bc
+            _cc = _types.ModuleType("triton.compiler")
+            _cc.__path__ = []
+            _ccc = _types.ModuleType("triton.compiler.compiler")
+            _ccc.__path__ = []
+            _cc.compiler = _ccc
+            _tr.compiler = _cc
             _sys2.modules["triton"] = _tr
             _sys2.modules["triton.language"] = _tl
+            _sys2.modules["triton.backends"] = _bc
+            _sys2.modules["triton.backends.compiler"] = _bcc
+            _sys2.modules["triton.compiler"] = _cc
+            _sys2.modules["triton.compiler.compiler"] = _ccc
     try:
         from scripts.inference_i2mv_sdxl import (prepare_pipeline,
                                                  run_pipeline)
