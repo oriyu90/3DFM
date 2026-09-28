@@ -111,10 +111,14 @@ def create_app() -> FastAPI:
     @app.post("/jobs", dependencies=[Depends(authed)])
     async def submit(spec: str = Form(...),
                      images: list[UploadFile] = File(default=[])):
+        if len(spec) > 64 * 1024:
+            raise HTTPException(422, "spec too large")
         try:
             body = json.loads(spec)
         except ValueError:
             raise HTTPException(422, "spec must be JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(422, "spec must be an object")
         mode = body.get("mode", "normal")
         if mode not in MODES:
             raise HTTPException(422, f"mode must be one of {MODES}")
@@ -123,18 +127,24 @@ def create_app() -> FastAPI:
         if len(images) > MAX_FILES:
             raise HTTPException(422, f"max {MAX_FILES} images")
         blobs: list[tuple[str, bytes]] = []
+        total = 0
         for up in images:
             data = await up.read()
             if len(data) > MAX_UPLOAD_BYTES:
                 raise HTTPException(422, f"{up.filename}: file too large")
             if not data:
                 raise HTTPException(422, f"{up.filename}: empty file")
+            total += len(data)
+            if total > MAX_UPLOAD_BYTES * MAX_FILES:
+                raise HTTPException(422, "total upload too large")
             blobs.append((Path(up.filename or "input").name, data))
         n = len(blobs)
         if mode == "normal" and n != 1:
             raise HTTPException(422, "normal mode needs exactly 1 image")
         if mode == "human" and n not in (1, 6):
             raise HTTPException(422, "human mode needs 1 or 6 images")
+        if mode == "test" and n > MAX_FILES:
+            raise HTTPException(422, f"max {MAX_FILES} images")
         name = str(body.get("name") or "job")[:80]
         seed = body.get("seed")
         try:
@@ -162,6 +172,16 @@ def create_app() -> FastAPI:
 
     @app.delete("/jobs/{jid}", dependencies=[Depends(authed)])
     def cancel_job(jid: str, force: bool = False):
+        job = app.state.store.get(jid)
+        if not job:
+            raise HTTPException(404, "not found")
+        # Finished history can be deleted (record + files) so GUI and
+        # CLI share the same operation. Running/queued go through the
+        # cooperative-cancel path.
+        if job["state"] in ("done", "failed", "cancelled"):
+            shutil.rmtree(app.state.dirs.job_dir(jid), ignore_errors=True)
+            app.state.store.delete(jid)
+            return {"ok": True, "message": "deleted"}
         ok, msg = app.state.mgr.cancel_job(jid, force=force)
         if not ok:
             raise HTTPException(404 if msg == "not found" else 409, msg)
@@ -176,10 +196,18 @@ def create_app() -> FastAPI:
 
     @app.post("/jobs/reorder", dependencies=[Depends(authed)])
     def reorder(body: dict):
-        ids = body.get("ids", [])
+        ids = body.get("ids", []) if isinstance(body, dict) else None
         if not isinstance(ids, list):
             raise HTTPException(422, "ids must be a list")
-        app.state.mgr.reorder([str(i) for i in ids])
+        if len(ids) > 1000:
+            raise HTTPException(422, "too many ids")
+        clean = []
+        for i in ids:
+            s = str(i)
+            if len(s) > 128 or "/" in s or ".." in s:
+                raise HTTPException(422, f"invalid job id: {s[:32]}")
+            clean.append(s)
+        app.state.mgr.reorder(clean)
         return {"ok": True}
 
     @app.get("/jobs/{jid}/log", dependencies=[Depends(authed)])
@@ -226,13 +254,66 @@ def create_app() -> FastAPI:
         items = []
         for m in manifest:
             p = app.state.dirs.models_dir / m["dir"]
-            present = p.is_dir() and any(p.iterdir())
+            try:
+                present = p.is_dir() and any(p.iterdir())
+            except OSError:
+                present = False
             size = _dir_size(p) if present else 0
             items.append({"id": m["id"], "present": present,
                           "size_gb": round(size / 1024**3, 2),
                           "expected_gb": m["gb"]})
         return {"models": items,
                 "runtimes": _runtime_status(app.state.dirs)}
+
+    @app.post("/models/ensure", dependencies=[Depends(authed)])
+    def models_ensure(body: dict | None = None):
+        """Trigger missing-model download (same script as Setup).
+
+        Body: {"tier": "normal"|"human"|"full"} (default normal).
+        Runs fetch_models.py synchronously (small) via subprocess and
+        returns per-model ok/pending. GUI and CLI share this endpoint
+        so both can perform the identical operation.
+        """
+        import subprocess as _sp
+        import sys as _sys
+        tier = "normal"
+        if isinstance(body, dict) and body.get("tier"):
+            tier = str(body["tier"])
+        if tier not in ("normal", "human", "full", "none"):
+            raise HTTPException(422, "tier must be normal|human|full|none")
+        # Locate fetch_models.py: bundled Resources/scripts or repo scripts.
+        cands = [
+            Path(__file__).resolve().parents[3] / "scripts" / "fetch_models.py",
+            Path(__file__).resolve().parents[2] / "fetch_models.py",
+        ]
+        script = next((c for c in cands if c.is_file()), None)
+        if script is None:
+            # Fallback: server/src is <root>/server/src -> scripts at <root>/scripts
+            alt = Path(__file__).resolve().parents[3] / "fetch_models.py"
+            script = alt if alt.is_file() else None
+        if script is None:
+            raise HTTPException(500, "fetch_models.py not found in bundle")
+        cmd = [_sys.executable, str(script), "--tier", tier,
+               "--models-dir", str(app.state.dirs.models_dir),
+               "--hf-bin", ""]
+        try:
+            proc = _sp.run(cmd, capture_output=True, text=True, timeout=3600)
+        except _sp.TimeoutExpired:
+            raise HTTPException(504, "model download timed out")
+        except OSError as e:
+            raise HTTPException(500, f"cannot start fetch: {e}")
+        # Manifest is the machine-readable result.
+        manifest_path = app.state.dirs.models_dir / "manifest.json"
+        manifest = {}
+        try:
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            manifest = {}
+        return {"ok": proc.returncode == 0, "tier": tier,
+                "returncode": proc.returncode,
+                "tail": (proc.stdout[-4000:] + proc.stderr[-2000:])[-6000:],
+                "manifest": manifest}
 
     @app.get("/settings", dependencies=[Depends(authed)])
     def get_settings():

@@ -56,3 +56,49 @@ def total_bytes() -> int:
         return int(out.strip())
     except ValueError:
         return -1
+
+
+def release_idle() -> dict:
+    """Best-effort idle memory release (server is stdlib-only).
+
+    - Python GC (collect cycles holding job dicts / progress buffers).
+    - Returns before/after free bytes so callers can log the effect.
+    - Never raises: idle GC must not destabilize the pump loop.
+    Worker GPU memory is reclaimed by process exit; here we only
+    clean the server side plus CPython allocator pressure.
+    """
+    try:
+        import gc as _gc
+        before = free_bytes()
+        _gc.collect()
+        # Allocator hint: try to return arenas on glibc-style builds.
+        # On macOS this is a no-op but harmless to attempt.
+        try:
+            import ctypes as _ct  # noqa: F401
+        except ImportError:
+            pass
+        after = free_bytes()
+        return {"before": before, "after": after}
+    except Exception:
+        return {"before": -1, "after": -1}
+
+
+def effective_cap_bytes(configured_gb: float) -> int:
+    """Clamp the RSS kill threshold so the OS keeps headroom.
+
+    On a 40 GiB machine a 40 GiB cap would let one worker starve the
+    OS. Keep at least ~6 GiB (or 15%) for the system/WindowServer.
+    Returns bytes, -1 if total unknown (caller falls back to config).
+    """
+    try:
+        total = total_bytes()
+        if total <= 0:
+            return -1
+        headroom = max(6 * 1024**3, int(total * 0.15))
+        adaptive = total - headroom
+        configured = int(float(configured_gb) * 1024**3)
+        if configured <= 0:
+            return adaptive
+        return min(configured, adaptive)
+    except (ValueError, TypeError):
+        return -1

@@ -88,7 +88,16 @@ struct JobsView: View {
                     Text("待機").tag("queued")
                     Text("完了").tag("done")
                     Text("失敗").tag("failed")
+                    Text("取消").tag("cancelled")
                 }.pickerStyle(.segmented).labelsHidden()
+            }
+            // CLI parity: reorder is a first-class operation (POST /jobs/reorder).
+            ToolbarItem(placement: .automatic) {
+                Menu("並び替え", systemImage: "arrow.up.arrow.down") {
+                    Button("選択を上へ") { moveSelection(by: -1) }
+                    Button("選択を下へ") { moveSelection(by: 1) }
+                }
+                .disabled(section != .queue || selection == nil)
             }
         }
         .sheet(isPresented: $backend.showNewJob) {
@@ -105,9 +114,11 @@ struct JobsView: View {
         }
         .onChange(of: section) { selection = nil; detail = nil }
         .task {
-            // live-refresh the open detail once per second
+            // live-refresh the open detail; back off when idle so an
+            // empty queue does not spin the CPU or hold memory.
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                let idle = backend.activeJob == nil && selection == nil
+                try? await Task.sleep(for: .seconds(idle ? 3 : 1))
                 await backend.refreshJobsQuiet()
                 if let id = selection {
                     detail = await backend.job(id: id)
@@ -115,6 +126,27 @@ struct JobsView: View {
                 }
             }
         }
+    }
+
+    private func moveSelection(by delta: Int) {
+        guard let sel = selection else { return }
+        var ids = jobsInScope.map(\.id)
+        guard let idx = ids.firstIndex(of: sel) else { return }
+        let dst = idx + delta
+        guard dst >= 0 && dst < ids.count else { return }
+        ids.swapAt(idx, dst)
+        // Preserve global queue order: merge moved ids back into the
+        // full queued list order for the server.
+        let allQueued = backend.queuedJobs.map(\.id)
+        var order = allQueued
+        // Apply the local swap to the global order when both ids are queued.
+        if let a = order.firstIndex(of: sel),
+           let b = order.firstIndex(of: ids[dst == idx ? idx : dst]) {
+            order.swapAt(a, b)
+        } else {
+            order = ids
+        }
+        Task { _ = await backend.reorder(ids: order) }
     }
 
     private var base: [Job] {
@@ -158,6 +190,8 @@ struct JobDetailView: View {
     var job: Job
     var logText: String
     @State private var artifacts: [Artifact] = []
+    @State private var busy = false
+    @State private var notice = ""
 
     private var detailLine: String {
         var s = "mode=\(job.mode) stage=\(job.stage) 進捗=\(Int(job.progress))%"
@@ -186,15 +220,44 @@ struct JobDetailView: View {
                     Button("キャンセル") {
                         Task { await backend.cancel(id: job.id) }
                     }
+                    if job.state == "running" {
+                        Button("強制終了") {
+                            Task { await backend.cancel(id: job.id, force: true) }
+                        }
+                    }
                 }
                 if job.state == "failed" || job.state == "cancelled"
                     || job.state == "done" {
                     Button("再実行") {
                         Task { await backend.retry(id: job.id) }
                     }
+                    Button("削除") {
+                        busy = true
+                        Task {
+                            let ok = await backend.deleteHistory(id: job.id)
+                            notice = ok ? "削除しました" : "削除に失敗しました"
+                            busy = false
+                        }
+                    }.disabled(busy)
                 }
                 Button("フォルダを開く") { openJobDir() }
                 Spacer()
+            }
+            if !notice.isEmpty {
+                Text(notice).font(.caption).foregroundStyle(.secondary)
+            }
+            // CLI parity: artifacts list + per-file download (GET /jobs/{id}/file).
+            if !artifacts.isEmpty {
+                Text("成果物 (\(artifacts.count))").font(.headline)
+                ForEach(artifacts, id: \.path) { a in
+                    HStack {
+                        Text(a.path).font(.caption).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text("\(a.size / 1024) KB").font(.caption).foregroundStyle(.secondary)
+                        Button("保存…") { saveArtifact(a) }
+                            .font(.caption)
+                    }
+                }
             }
             Text("ログ").font(.headline)
             ScrollView {
@@ -213,6 +276,26 @@ struct JobDetailView: View {
     private func openJobDir() {
         let dir = Paths.dataDir.appendingPathComponent("jobs/\(job.id)")
         NSWorkspace.shared.open(dir)
+    }
+
+    private func saveArtifact(_ a: Artifact) {
+        Task {
+            guard let data = await backend.artifactData(jobId: job.id, path: a.path) else {
+                notice = "ダウンロードに失敗: \(a.path)"
+                return
+            }
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = URL(fileURLWithPath: a.path).lastPathComponent
+            NSApp.activate(ignoringOtherApps: true)
+            if panel.runModal() == .OK, let url = panel.url {
+                do {
+                    try data.write(to: url)
+                    notice = "保存しました: \(url.lastPathComponent)"
+                } catch {
+                    notice = "保存に失敗: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 }
 
@@ -241,9 +324,12 @@ struct SetupWizardView: View {
                 Button("選択…", action: pickDir)
             }
             Picker("モデル", selection: $tier) {
-                Text("普通モード (~16GB)").tag("normal")
-                Text("人物モード込み (~35GB)").tag("human")
+                Text("普通 (~16GB)").tag("normal")
+                Text("人物込み (~35GB)").tag("human")
+                Text("フル (humanと同等)").tag("full")
             }.pickerStyle(.segmented)
+            Text("40GB+メモリのMacでは human/full を推奨。CLI `3dfm models ensure --tier human` と同一内容です。")
+                .font(.caption).foregroundStyle(.secondary)
             DisclosureGroup("Hugging Face トークン (ゲート付きモデル用・任意)") {
                 SecureField("hf_... (同意済みトークン)", text: $hfToken)
                     .textFieldStyle(.roundedBorder)
@@ -318,6 +404,10 @@ final class SetupRunner: ObservableObject {
         running = true
         failed = ""
         done = false
+        // Pin this instance for the detached reader below. init() also
+        // sets it, but start() must re-pin: a recreated View may have
+        // replaced the registry with a newer runner.
+        SetupRunner.shared = self
         if !hfToken.isEmpty { HFTokenStore.save(hfToken) }
         Task.detached {
             let proc = Process()
@@ -371,6 +461,9 @@ final class SetupRunner: ObservableObject {
                     r.phaseMsg = "完了"
                 } else if r.failed.isEmpty {
                     r.failed = "セットアップが異常終了しました (code \(proc.terminationStatus))。ログ: ~/Library/Application Support/3DFM/logs/setup.log"
+                }
+                if SetupRunner.shared === r {
+                    SetupRunner.shared = nil
                 }
             }
         }
@@ -429,6 +522,13 @@ struct GeneralSettingsPane: View {
     @State private var texture = 2048
     @State private var pipeline = "512->1024"
     @State private var memCap = "40"
+    @State private var memMinFree = "12"
+    @State private var stallTimeout = "1800"
+    @State private var cancelGrace = "10"
+    @State private var idleGc = "60"
+    @State private var retention = "0"
+    @State private var port = "44931"
+    @State private var notify = true
     @State private var saved = ""
 
     var body: some View {
@@ -448,25 +548,49 @@ struct GeneralSettingsPane: View {
                 Text("512→1024 (標準)").tag("512->1024")
                 Text("512→1536 (最高)").tag("512->1536")
             }
-            TextField("メモリ上限 (GB):", text: $memCap)
+            TextField("メモリ上限 RSS (GB):", text: $memCap)
+            TextField("開始に必要な空き (GB):", text: $memMinFree)
+            TextField("停滞タイムアウト (秒):", text: $stallTimeout)
+            TextField("キャンセル猶予 (秒):", text: $cancelGrace)
+            TextField("待機時GC間隔 (秒, 0=無効):", text: $idleGc)
+            TextField("履歴保持 (日, 0=無期限):", text: $retention)
+            TextField("ポート:", text: $port)
+            Toggle("完了通知", isOn: $notify)
             Toggle("メニューバーに表示", isOn: $showMenuBarExtra)
             HStack {
                 Button("保存") { save() }
+                Button("再読込") { Task { await load() } }
                 if !saved.isEmpty {
                     Text(saved).foregroundStyle(.secondary)
                 }
             }
+            Text("CLI `3dfm settings set` と同一キーです。")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
         .padding(18)
-        .task {
-            if let s = await backend.settings() {
-                outputDir = (s["output_dir"] as? String) ?? ""
-                texture = (s["texture_default"] as? NSNumber)?.intValue ?? 2048
-                pipeline = (s["pipeline_default"] as? String) ?? "512->1024"
-                memCap = String((s["mem_cap_gb"] as? NSNumber)?.intValue ?? 40)
-            }
+        .task { await load() }
+    }
+
+    private func load() async {
+        if let s = await backend.settings() {
+            outputDir = (s["output_dir"] as? String) ?? ""
+            texture = (s["texture_default"] as? NSNumber)?.intValue ?? 2048
+            pipeline = (s["pipeline_default"] as? String) ?? "512->1024"
+            memCap = numStr(s["mem_cap_gb"], fallback: "40")
+            memMinFree = numStr(s["mem_min_free_gb"], fallback: "12")
+            stallTimeout = numStr(s["stall_timeout_s"], fallback: "1800")
+            cancelGrace = numStr(s["cancel_grace_s"], fallback: "10")
+            idleGc = numStr(s["idle_gc_s"], fallback: "60")
+            retention = numStr(s["retention_days"], fallback: "0")
+            port = numStr(s["port"], fallback: "44931")
+            notify = (s["notify"] as? Bool) ?? true
         }
+    }
+
+    private func numStr(_ v: Any?, fallback: String) -> String {
+        if let n = v as? NSNumber { return n.stringValue }
+        return fallback
     }
 
     private func pickDir() {
@@ -487,8 +611,15 @@ struct GeneralSettingsPane: View {
                 "texture_default": texture,
                 "pipeline_default": pipeline,
                 "mem_cap_gb": Double(memCap) ?? 40,
+                "mem_min_free_gb": Double(memMinFree) ?? 12,
+                "stall_timeout_s": Double(stallTimeout) ?? 1800,
+                "cancel_grace_s": Double(cancelGrace) ?? 10,
+                "idle_gc_s": Double(idleGc) ?? 60,
+                "retention_days": Double(retention) ?? 0,
+                "port": Int(port) ?? 44931,
+                "notify": notify,
             ])
-            saved = ok ? "保存しました" : "保存に失敗しました"
+            saved = ok ? "保存しました" : "保存に失敗しました (値をCLI `3dfm settings get` と比較してください)"
         }
     }
 }
@@ -497,7 +628,10 @@ struct ModelsSettingsPane: View {
     @EnvironmentObject var backend: Backend
     @Environment(\.openWindow) private var openWindow
     @State private var models: [ModelInfo] = []
+    @State private var runtimes: [String: String] = [:]
     @State private var hasToken = !HFTokenStore.load().isEmpty
+    @State private var ensureMsg = ""
+    @State private var ensureBusy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -521,6 +655,31 @@ struct ModelsSettingsPane: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }.font(.callout)
             }
+            if !runtimes.isEmpty {
+                Divider()
+                ForEach(runtimes.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+                    HStack {
+                        Text("runtime \(k)").font(.caption)
+                        Spacer()
+                        Text(v).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if !ensureMsg.isEmpty {
+                Text(ensureMsg).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            }
+            HStack {
+                Button("不足モデルを取得 (normal)") {
+                    ensure(tier: "normal")
+                }.disabled(ensureBusy)
+                Button("人物込み (human)") {
+                    ensure(tier: "human")
+                }.disabled(ensureBusy)
+                Spacer()
+            }
+            .font(.callout)
+            Text("CLI `3dfm models ensure --tier human` と同一操作です。")
+                .font(.caption).foregroundStyle(.secondary)
             Spacer()
             HStack {
                 Text(hasToken ? "HFトークン: 登録済み" : "HFトークン: 未登録")
@@ -545,6 +704,29 @@ struct ModelsSettingsPane: View {
             }
         }
         .padding(18)
-        .task { models = await backend.models()?.models ?? [] }
+        .task { await refresh() }
+    }
+
+    private func refresh() async {
+        if let st = await backend.models() {
+            models = st.models
+            var r: [String: String] = [:]
+            for (k, v) in st.runtimes ?? [:] {
+                r[k] = (v.present == true) ? "導入済み" : "未導入"
+            }
+            runtimes = r
+        }
+        hasToken = !HFTokenStore.load().isEmpty
+    }
+
+    private func ensure(tier: String) {
+        ensureBusy = true
+        ensureMsg = "取得中… (\(tier))"
+        Task {
+            let out = await backend.modelsEnsure(tier: tier)
+            ensureMsg = String(out.prefix(800))
+            ensureBusy = false
+            await refresh()
+        }
     }
 }

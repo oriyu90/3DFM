@@ -57,7 +57,10 @@ final class Backend: ObservableObject {
             guard let self else { return }
             while !Task.isCancelled {
                 await self.refreshJobsQuiet()
-                try? await Task.sleep(for: .seconds(1))
+                // Idle backoff: 1s while work exists, 3s when idle so an
+                // idle menu-bar app holds ~no CPU and lets memory settle.
+                let idle = await MainActor.run { self.activeJob == nil }
+                try? await Task.sleep(for: .seconds(idle ? 3 : 1))
             }
         }
     }
@@ -209,6 +212,68 @@ final class Backend: ObservableObject {
         await refreshJobsQuiet()
     }
 
+    /// Delete finished history (done/failed/cancelled). Same DELETE
+    /// endpoint as cancel; the server routes by state so GUI and CLI
+    /// share one operation.
+    func deleteHistory(id: String) async -> Bool {
+        let comps = URLComponents(url: baseURL.appendingPathComponent("jobs/\(id)"),
+                                  resolvingAgainstBaseURL: false)!
+        // Percent-encode the id segment safely.
+        guard let url = comps.url else { return false }
+        var req = URLRequest(url: url, timeoutInterval: 20)
+        req.httpMethod = "DELETE"
+        authed(&req)
+        guard let (_, resp) = try? await URLSession.shared.data(for: req) else {
+            return false
+        }
+        let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+        await refreshJobsQuiet()
+        return ok
+    }
+
+    func reorder(ids: [String]) async -> Bool {
+        var req = URLRequest(url: baseURL.appendingPathComponent("jobs/reorder"),
+                             timeoutInterval: 20)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        authed(&req)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["ids": ids])
+        guard let (_, resp) = try? await URLSession.shared.data(for: req) else {
+            return false
+        }
+        let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+        await refreshJobsQuiet()
+        return ok
+    }
+
+    func modelsEnsure(tier: String) async -> String {
+        var req = URLRequest(url: baseURL.appendingPathComponent("models/ensure"),
+                             timeoutInterval: 3600)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        authed(&req)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["tier": tier])
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let s = String(data: data, encoding: .utf8) else {
+            return "モデル取得の開始に失敗しました"
+        }
+        return s
+    }
+
+    func artifactData(jobId: String, path: String) async -> Data? {
+        var comps = URLComponents(
+            url: baseURL.appendingPathComponent("jobs/\(jobId)/file"),
+            resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "path", value: path)]
+        guard let url = comps.url else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 120)
+        authed(&req)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return data
+    }
+
     func retry(id: String) async {
         var req = URLRequest(url: baseURL.appendingPathComponent("jobs/\(id)/retry"),
                              timeoutInterval: 30)
@@ -222,14 +287,17 @@ final class Backend: ObservableObject {
 
     func submit(name: String, mode: String, seed: Int?, textureSize: Int,
                 pipeline: String, synthesizeViews: Bool,
-                files: [URL]) async throws -> String {
+                files: [URL],
+                extra: [String: Any] = [:]) async throws -> String {
         let boundary = "3DFM-\(UUID().uuidString)"
         var body = Data()
-        let spec: [String: Any] = [
+        var spec: [String: Any] = [
             "mode": mode, "name": name,
-            "seed": seed as Any, "texture_size": textureSize,
+            "texture_size": textureSize,
             "pipeline_type": pipeline, "synthesize_views": synthesizeViews,
         ]
+        if let seed { spec["seed"] = seed } else { spec["seed"] = NSNull() }
+        for (k, v) in extra { spec[k] = v }
         let specData = try JSONSerialization.data(withJSONObject: spec)
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"spec\"\r\n\r\n"

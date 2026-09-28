@@ -56,18 +56,20 @@ def venv_probe(python: Path) -> dict:
     code, out = run([str(python), "-c",
                      "import sys; print(sys.version.split()[0])"])
     info["python"] = out if code == 0 else f"broken: {out}"
+    # Cold torch import can exceed 15s on first run; allow 60s.
     code, out = run([str(python), "-c",
-                     "import torch; print(torch.__version__)"])
+                     "import torch; print(torch.__version__)"], timeout=60)
     info["torch"] = out if code == 0 else None
     if info["torch"]:
         code, out = run([str(python), "-c",
                          "import torch; print(torch.backends.mps.is_available()"
-                         " if hasattr(torch.backends,'mps') else False)"])
+                         " if hasattr(torch.backends,'mps') else False)"],
+                        timeout=60)
         info["mps"] = (out == "True") if code == 0 else False
-    code, out = run([str(python), "-c", "import mlx; print('1')"])
+    code, out = run([str(python), "-c", "import mlx; print('1')"], timeout=60)
     info["mlx"] = (code == 0)
     for mod in ("mtlgemm", "mtldiffrast", "fast_simplification", "xatlas"):
-        code, _ = run([str(python), "-c", f"import {mod}"])
+        code, _ = run([str(python), "-c", f"import {mod}"], timeout=60)
         info[f"mod_{mod}"] = (code == 0)
     return info
 
@@ -95,12 +97,25 @@ def main() -> int:
     warnings: list[str] = []
     if result["arch"] != "arm64":
         warnings.append("Apple Silicon required")
+    # macOS 26+ is the primary target (Metal MSL 4.0 toolchain).
+    try:
+        major = int(str(result["macos"]).split(".")[0])
+        if major < 14:
+            warnings.append(f"macOS {result['macos']}: 14+ required")
+        elif major < 26:
+            warnings.append(f"macOS {result['macos']}: 26+ recommended "
+                            "(Metal extensions need MSL 4.0; older OS uses KDTree fallback)")
+    except (ValueError, IndexError):
+        pass
     if result["mem_total_gb"] > 0 and result["mem_total_gb"] < 16:
         warnings.append(f"only {result['mem_total_gb']} GiB memory; "
                         "16 GiB minimum, generation will be limited")
+    elif result["mem_total_gb"] > 0 and result["mem_total_gb"] < 40:
+        warnings.append(f"{result['mem_total_gb']} GiB memory: normal tier OK; "
+                        "human/full prefers 40 GiB+ (auto-degraded guards apply)")
     if result["disk_free_gb"] < 40:
         warnings.append(f"only {result['disk_free_gb']} GiB disk free; "
-                        "full models need ~35 GiB")
+                        "full models need ~35 GiB (+runtimes/work ~25 GiB)")
     if not result["metal_toolchain"]:
         warnings.append("Metal toolchain missing: texture baking falls back "
                         "to slower KDTree path")

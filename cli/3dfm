@@ -117,13 +117,41 @@ def cmd_submit(a: API, args):
     p.add_argument("--texture-size", type=int, default=2048)
     p.add_argument("--pipeline-type", default="512->1024")
     p.add_argument("--synthesize-views", action="store_true")
+    p.add_argument("--rembg-threshold", type=float, default=None)
+    p.add_argument("--decimation-target", type=int, default=None)
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--mv-prompt", default=None)
+    p.add_argument("--mv-steps", type=int, default=None)
+    p.add_argument("--mv-resolution", type=int, default=None)
+    p.add_argument("--spec-json", default=None,
+                   help="extra spec as JSON object (merged, CLI flags win)")
     p.add_argument("--duration-s", type=float, default=None)  # test backend
     p.add_argument("--fail-at", default=None)                 # test backend
     ns = p.parse_args(args)
-    spec = {"mode": ns.mode, "name": ns.name, "seed": ns.seed,
-            "texture_size": ns.texture_size,
-            "pipeline_type": ns.pipeline_type,
-            "synthesize_views": ns.synthesize_views}
+    spec: dict = {}
+    if ns.spec_json:
+        try:
+            extra = json.loads(ns.spec_json)
+            if isinstance(extra, dict):
+                spec.update(extra)
+        except ValueError:
+            sys.exit("spec-json must be a JSON object")
+    spec.update({"mode": ns.mode, "name": ns.name, "seed": ns.seed,
+                 "texture_size": ns.texture_size,
+                 "pipeline_type": ns.pipeline_type,
+                 "synthesize_views": ns.synthesize_views})
+    if ns.rembg_threshold is not None:
+        spec["rembg_threshold"] = ns.rembg_threshold
+    if ns.decimation_target is not None:
+        spec["decimation_target"] = ns.decimation_target
+    if ns.steps is not None:
+        spec["steps"] = ns.steps
+    if ns.mv_prompt is not None:
+        spec["mv_prompt"] = ns.mv_prompt
+    if ns.mv_steps is not None:
+        spec["mv_steps"] = ns.mv_steps
+    if ns.mv_resolution is not None:
+        spec["mv_resolution"] = ns.mv_resolution
     if ns.duration_s is not None:
         spec["duration_s"] = ns.duration_s
     if ns.fail_at is not None:
@@ -132,18 +160,30 @@ def cmd_submit(a: API, args):
 
 
 def cmd_list(a: API, args):
-    state = args[0] if args else None
-    q = f"?state={urllib.parse.quote(state)}" if state else ""
-    for j in a.req("GET", "/jobs" + q)["jobs"]:
+    import argparse
+    p = argparse.ArgumentParser(prog="3dfm list")
+    p.add_argument("state", nargs="?", default=None,
+                   help="e.g. queued|running|done|failed|cancelled or comma list")
+    p.add_argument("--json", action="store_true")
+    ns = p.parse_args(args)
+    q = f"?state={urllib.parse.quote(ns.state)}" if ns.state else ""
+    jobs = a.req("GET", "/jobs" + q)["jobs"]
+    if ns.json:
+        print(json.dumps(jobs, indent=2, ensure_ascii=False))
+        return
+    for j in jobs:
         print(f"{j['id']}  {j['state']:9s} {j['progress']:5.1f}%  "
               f"{j['stage']}  {j['name']}")
 
 
 def cmd_show(a: API, args):
     follow = "--follow" in args
-    jid = [x for x in args if not x.startswith("--")][0]
+    rest = [x for x in args if not x.startswith("--")]
+    if not rest:
+        sys.exit("usage: 3dfm show <job-id> [--follow]")
+    jid = rest[0]
     while True:
-        j = a.req("GET", f"/jobs/{jid}")
+        j = a.req("GET", f"/jobs/{urllib.parse.quote(jid)}")
         print(f"{j['state']} {j['progress']:.1f}% [{j['stage']}] "
               f"eta={j['eta_s']} err={j['error']}")
         if not follow or j["state"] not in ("queued", "running"):
@@ -153,9 +193,19 @@ def cmd_show(a: API, args):
 
 def cmd_cancel(a: API, args):
     force = "--force" in args
-    jid = [x for x in args if not x.startswith("--")][0]
+    rest = [x for x in args if not x.startswith("--")]
+    if not rest:
+        sys.exit("usage: 3dfm cancel <job-id> [--force]")
+    jid = rest[0]
     q = "?force=true" if force else ""
-    print(a.req("DELETE", f"/jobs/{jid}" + q))
+    print(a.req("DELETE", f"/jobs/{urllib.parse.quote(jid)}" + q))
+
+
+def cmd_delete(a: API, args):
+    """Delete finished history (same endpoint as cancel; server routes)."""
+    if not args:
+        sys.exit("usage: 3dfm delete <job-id>")
+    print(a.req("DELETE", f"/jobs/{urllib.parse.quote(args[0])}"))
 
 
 def cmd_retry(a: API, args):
@@ -163,21 +213,86 @@ def cmd_retry(a: API, args):
                      ensure_ascii=False))
 
 
+def cmd_reorder(a: API, args):
+    """Reorder queue: 3dfm reorder <id1> <id2> ... (FIFO order)."""
+    if not args:
+        sys.exit("usage: 3dfm reorder <job-id> [...]")
+    print(json.dumps(a.req("POST", "/jobs/reorder", {"ids": args}),
+                     ensure_ascii=False))
+
+
 def cmd_log(a: API, args):
-    jid = args[0]
-    print(a.req("GET", f"/jobs/{jid}/log?tail=200")["log"])
+    import argparse
+    p = argparse.ArgumentParser(prog="3dfm log")
+    p.add_argument("job_id")
+    p.add_argument("--tail", type=int, default=200)
+    ns = p.parse_args(args)
+    print(a.req("GET",
+                f"/jobs/{urllib.parse.quote(ns.job_id)}/log?tail={ns.tail}")["log"])
+
+
+def cmd_artifacts(a: API, args):
+    import argparse
+    p = argparse.ArgumentParser(prog="3dfm artifacts")
+    p.add_argument("job_id")
+    p.add_argument("--json", action="store_true")
+    ns = p.parse_args(args)
+    arts = a.req("GET", f"/jobs/{urllib.parse.quote(ns.job_id)}/artifacts")
+    if ns.json:
+        print(json.dumps(arts, indent=2, ensure_ascii=False))
+        return
+    for x in arts.get("artifacts", []):
+        print(f"{x['size']:10d}  {x['path']}")
+
+
+def cmd_file(a: API, args):
+    """Download one artifact: 3dfm file <job-id> <path> [--out FILE]."""
+    import argparse
+    p = argparse.ArgumentParser(prog="3dfm file")
+    p.add_argument("job_id")
+    p.add_argument("path")
+    p.add_argument("--out", default=None)
+    ns = p.parse_args(args)
+    # Raw download (bytes, not JSON).
+    base = f"http://127.0.0.1:{find_port()}"
+    url = (f"{base}/jobs/{urllib.parse.quote(ns.job_id)}/file"
+           f"?path={urllib.parse.quote(ns.path)}")
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token()}"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail", e.reason)
+        except ValueError:
+            detail = e.reason
+        sys.exit(f"error {e.code}: {detail}")
+    out = Path(ns.out) if ns.out else Path(Path(ns.path).name)
+    out.write_bytes(data)
+    print(str(out))
 
 
 def cmd_open(a: API, args):
-    j = a.req("GET", f"/jobs/{args[0]}")
-    arts = a.req("GET", f"/jobs/{args[0]}/artifacts")["artifacts"]
-    glbs = [x for x in arts if x["path"].endswith(".glb")]
-    target = glbs[0]["path"] if glbs else None
-    d = data_dir() / "jobs" / args[0]
+    if not args:
+        sys.exit("usage: 3dfm open <job-id>")
+    jid = args[0]
+    a.req("GET", f"/jobs/{urllib.parse.quote(jid)}")  # 404 early if missing
+    d = data_dir() / "jobs" / jid
     subprocess.run(["open", str(d)], check=False)
 
 
-def cmd_models(a: API, _):
+def cmd_models(a: API, args):
+    if args and args[0] == "ensure":
+        tier = "normal"
+        for i, x in enumerate(args):
+            if x == "--tier" and i + 1 < len(args):
+                tier = args[i + 1]
+        print(json.dumps(a.req("POST", "/models/ensure", {"tier": tier}),
+                         indent=2, ensure_ascii=False))
+        return
+    if args and args[0] not in ("status",):
+        sys.exit("usage: 3dfm models [status|ensure [--tier normal|human|full]]")
     print(json.dumps(a.req("GET", "/models/status"),
                      indent=2, ensure_ascii=False))
 
@@ -215,8 +330,10 @@ def cmd_serve(_a, args):
 
 
 COMMANDS = {"status": cmd_status, "submit": cmd_submit, "list": cmd_list,
-            "show": cmd_show, "cancel": cmd_cancel, "retry": cmd_retry,
-            "log": cmd_log, "open": cmd_open, "models": cmd_models,
+            "show": cmd_show, "cancel": cmd_cancel, "delete": cmd_delete,
+            "retry": cmd_retry, "reorder": cmd_reorder, "log": cmd_log,
+            "artifacts": cmd_artifacts, "file": cmd_file,
+            "open": cmd_open, "models": cmd_models,
             "settings": cmd_settings, "serve": cmd_serve}
 
 

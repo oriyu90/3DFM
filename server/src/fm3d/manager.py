@@ -127,6 +127,10 @@ class JobManager:
         self._termed: set[str] = set()
         self._last_db_push: dict[str, float] = {}
         self._stop = False
+        # Idle-memory state: last time we did real work, and last idle GC.
+        self._last_activity = time.time()
+        self._last_idle_gc = 0.0
+        self._idle_ticks = 0
 
     # -- public API used by REST --------------------------------------
     def create_job(self, name: str, mode: str, spec: dict,
@@ -153,13 +157,21 @@ class JobManager:
         if job["state"] == "queued":
             self._remove_job_files(job_id)
             self.store.delete(job_id)
+            # Queued jobs never spawned; drop any cached tail state.
+            self._offsets.pop(job_id, None)
+            self._last_db_push.pop(job_id, None)
+            self._cancel_at.pop(job_id, None)
+            self._termed.discard(job_id)
             return True, "cancelled"
         if job["state"] != "running":
             return False, f"job is {job['state']}"
         (self.dirs.job_dir(job_id) / "cancel.flag").touch(exist_ok=True)
         self._cancel_at[job_id] = time.time()
         if force:
+            proc = self._procs.get(job_id)
             self._kill(job_id, signal.SIGKILL)
+            if proc is not None:
+                self._schedule_reap(proc)
             self._finalize(job_id, cancelled=True,
                            error="cancelled (forced)")
             return True, "cancelled"
@@ -199,23 +211,70 @@ class JobManager:
     async def run_forever(self) -> None:
         while not self._stop:
             try:
-                await self._tick()
+                idle = await self._tick()
             except Exception:
                 traceback.print_exc()
-            await asyncio.sleep(0.5)
+                idle = False
+            # Idle backoff: hot loop (0.5s) while work exists, cool
+            # loop (2s) when the queue is empty so an idle app holds
+            # ~no CPU and lets the OS reclaim pressure.
+            await asyncio.sleep(2.0 if idle else 0.5)
 
     def stop(self) -> None:
         self._stop = True
 
-    async def _tick(self) -> None:
+    async def _tick(self) -> bool:
+        """One pump step. Returns True when fully idle (no work)."""
         running = self.store.running()
         if running is not None:
+            self._last_activity = time.time()
+            self._idle_ticks = 0
             await self._supervise(running["id"])
-            return
+            return False
         nxt = self.store.next_queued()
         if nxt is None:
-            return
+            self._idle_ticks += 1
+            self._maybe_idle_gc()
+            return True
+        self._last_activity = time.time()
+        self._idle_ticks = 0
         await self._maybe_start(nxt)
+        return False
+
+    def _maybe_idle_gc(self) -> None:
+        """Release server-side memory when the queue stays empty.
+
+        Called from the idle branch of _tick. Runs at most once per
+        `idle_gc_s` (settings, default 60s) and only after the pump
+        has observed sustained idleness, so a brief gap between jobs
+        does not thrash.
+        """
+        try:
+            settings = self.get_settings()
+            interval = float(settings.get("idle_gc_s", 60) or 60)
+        except (TypeError, ValueError):
+            interval = 60.0
+        if interval <= 0:
+            return
+        now = time.time()
+        # Require a few idle ticks first (avoids GC between back-to-back jobs).
+        if self._idle_ticks < 3:
+            return
+        if now - self._last_idle_gc < interval:
+            return
+        if now - self._last_activity < interval:
+            return
+        self._last_idle_gc = now
+        try:
+            import gc as _gc
+            _gc.collect()
+            res = memguard.release_idle()
+            b, a = res.get("before", -1), res.get("after", -1)
+            print(f"[idle-gc] released server memory "
+                  f"(free {b/1024**3:.1f} -> {a/1024**3:.1f} GiB)",
+                  flush=True)
+        except Exception:
+            traceback.print_exc()
 
     # -- start ------------------------------------------------------------
     def _worker_python(self, mode: str) -> tuple[Optional[str], str]:
@@ -345,11 +404,18 @@ class JobManager:
             if now - self._cancel_at.get(jid, now) > 20:
                 self._kill(jid, signal.SIGKILL)
             return
-        # RSS cap
-        cap = float(settings.get("mem_cap_gb", 40.0)) * 1024**3
+        # RSS cap (adaptive: never let one worker starve the OS).
+        try:
+            configured = float(settings.get("mem_cap_gb", 40.0))
+        except (TypeError, ValueError):
+            configured = 40.0
+        eff = memguard.effective_cap_bytes(configured)
+        cap = eff if eff > 0 else int(configured * 1024**3)
         rss = memguard.rss_of_pid(self._proc_pid(proc))
         if rss > 0 and rss > cap:
             self._kill(jid, signal.SIGKILL)
+            # Schedule a reaper; finalizing now drops the handle.
+            self._schedule_reap(proc)
             self._finalize(jid, failed=True,
                            error=f"memory cap exceeded "
                                  f"(RSS {rss/1024**3:.1f} GiB > "
@@ -361,8 +427,13 @@ class JobManager:
         except OSError:
             job = self.store.get(jid)
             mtime = (job or {}).get("started_at") or now
-        if now - mtime > float(settings.get("stall_timeout_s", 1800)):
+        try:
+            stall_s = float(settings.get("stall_timeout_s", 1800))
+        except (TypeError, ValueError):
+            stall_s = 1800.0
+        if now - mtime > stall_s:
             self._kill(jid, signal.SIGKILL)
+            self._schedule_reap(proc)
             self._finalize(jid, failed=True,
                            error=f"stalled: no progress for "
                                  f"{int(now-mtime)}s")
@@ -383,15 +454,30 @@ class JobManager:
             with open(p, "rb") as f:
                 f.seek(off)
                 chunk = f.read()
-                self._offsets[jid] = f.tell()
+                end = f.tell()
         except OSError:
             return
+        # Only consume complete lines. If the worker was mid-write,
+        # the trailing partial line stays for the next tick instead
+        # of being dropped (previous code advanced past it and lost
+        # the final 100% update).
+        last_nl = chunk.rfind(b"\n")
+        if last_nl < 0:
+            # No complete line yet; wait for the newline.
+            # Guard against an unbounded single line.
+            if len(chunk) > 1024 * 1024:
+                self._offsets[jid] = end
+            return
+        consumable = chunk[:last_nl + 1]
+        self._offsets[jid] = off + len(consumable)
         last = None
-        for line in chunk.splitlines():
+        for line in consumable.splitlines():
+            if not line.strip():
+                continue
             try:
                 last = json.loads(line)
             except ValueError:
-                continue  # partial line at EOF; next tick rereads it
+                continue
         if not isinstance(last, dict):
             return
         now = time.time()
@@ -435,6 +521,18 @@ class JobManager:
         self._procs.pop(jid, None)
         self._cancel_at.pop(jid, None)
         self._termed.discard(jid)
+        # Per-job tail state is pure cache: drop it so an idle server
+        # does not grow _offsets/_last_db_push without bound.
+        self._offsets.pop(jid, None)
+        self._last_db_push.pop(jid, None)
+        self._last_activity = time.time()
+        # Opportunistic server-side GC after each job: the pump may go
+        # idle next, and we want file buffers / SQLite pages released.
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
         now = time.time()
         if done:
             self.store.set_state(jid, "done", stage="done",
@@ -505,6 +603,24 @@ class JobManager:
             else:
                 proc.send_signal(sig)
         except (OSError, ProcessLookupError, RuntimeError):
+            pass
+
+    def _schedule_reap(self, proc) -> None:
+        """Reap an asyncio child we are about to drop (anti-zombie).
+
+        The RSS/stall paths finalize immediately, which pops the
+        handle from _procs. Without a waiter the PID stays a zombie
+        until server exit. Fire-and-forget a waiter instead.
+        """
+        try:
+            import asyncio as _aio
+            if hasattr(proc, "wait") and not isinstance(proc, AdoptedProc):
+                try:
+                    loop = _aio.get_running_loop()
+                    loop.create_task(proc.wait())
+                except RuntimeError:
+                    pass
+        except Exception:
             pass
 
     def _remove_job_files(self, job_id: str) -> None:

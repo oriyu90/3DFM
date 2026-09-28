@@ -131,6 +131,12 @@ struct NewJobView: View {
     @State private var texture = 2048
     @State private var pipeline = "512->1024"
     @State private var synthesize = false
+    @State private var rembgText = ""
+    @State private var decimationText = ""
+    @State private var stepsText = ""
+    @State private var mvPrompt = ""
+    @State private var mvStepsText = ""
+    @State private var mvResText = ""
     @State private var busy = false
     @State private var error = ""
 
@@ -154,7 +160,7 @@ struct NewJobView: View {
             if mode == "human" && files.count == 1 {
                 Toggle("正面1枚から残り5視点を合成 (MV-Adapter)", isOn: $synthesize)
             }
-            DisclosureGroup("詳細設定") {
+            DisclosureGroup("詳細設定 (CLIと同一)") {
                 TextField("seed (空=ランダム)", text: $seedText)
                     .textFieldStyle(.roundedBorder)
                 Picker("パイプライン", selection: $pipeline) {
@@ -167,6 +173,20 @@ struct NewJobView: View {
                     Text("2048").tag(2048)
                     Text("4096").tag(4096)
                 }.pickerStyle(.segmented)
+                TextField("背景除去しきい値 (空=既定 0.5/人物0.4)", text: $rembgText)
+                    .textFieldStyle(.roundedBorder)
+                TextField("decimation_target (空=既定)", text: $decimationText)
+                    .textFieldStyle(.roundedBorder)
+                TextField("拡散steps (空=既定)", text: $stepsText)
+                    .textFieldStyle(.roundedBorder)
+                if mode == "human" {
+                    TextField("MVプロンプト (空=high quality)", text: $mvPrompt)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("MV steps (空=50)", text: $mvStepsText)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("MV解像度 (空=自動)", text: $mvResText)
+                        .textFieldStyle(.roundedBorder)
+                }
             }
             if !error.isEmpty {
                 Text(error).foregroundStyle(.red).font(.callout)
@@ -199,11 +219,30 @@ struct NewJobView: View {
         Task {
             do {
                 let seed = Int(seedText.trimmingCharacters(in: .whitespaces))
+                var extra: [String: Any] = [:]
+                if let v = Double(rembgText.trimmingCharacters(in: .whitespaces)), !rembgText.isEmpty {
+                    extra["rembg_threshold"] = v
+                }
+                if let v = Int(decimationText.trimmingCharacters(in: .whitespaces)), !decimationText.isEmpty {
+                    extra["decimation_target"] = v
+                }
+                if let v = Int(stepsText.trimmingCharacters(in: .whitespaces)), !stepsText.isEmpty {
+                    extra["steps"] = v
+                }
+                if !mvPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
+                    extra["mv_prompt"] = mvPrompt
+                }
+                if let v = Int(mvStepsText.trimmingCharacters(in: .whitespaces)), !mvStepsText.isEmpty {
+                    extra["mv_steps"] = v
+                }
+                if let v = Int(mvResText.trimmingCharacters(in: .whitespaces)), !mvResText.isEmpty {
+                    extra["mv_resolution"] = v
+                }
                 _ = try await backend.submit(
                     name: name.isEmpty ? "job" : name,
                     mode: mode, seed: seed, textureSize: texture,
                     pipeline: pipeline, synthesizeViews: synthesize,
-                    files: files)
+                    files: files, extra: extra)
                 dismiss()
             } catch {
                 self.error = "投入に失敗: \(error.localizedDescription)"

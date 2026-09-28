@@ -24,15 +24,47 @@ from .worker import Cancelled, Ctx, atomic_write_bytes
 
 
 # ------------------------------------------------------------------ registry
+def _cleanup_gpu() -> None:
+    """Best-effort GPU/CPU memory release for idle transitions.
+
+    Called after each heavy stage and before worker exit so unified
+    memory is returned promptly even if the OS keeps the process
+    alive briefly (e.g. crash-report suspension). Never raises.
+    """
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    try:
+        import torch as _t
+        if getattr(_t.backends, "mps", None) and _t.backends.mps.is_available():
+            try:
+                _t.mps.empty_cache()
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    try:
+        import gc as _gc2
+        _gc2.collect()
+    except Exception:
+        pass
+
+
 def run(ctx: Ctx, mode: str, name: str) -> None:
-    if mode == "test":
-        run_test(ctx)
-    elif mode == "normal":
-        run_normal(ctx)
-    elif mode == "human":
-        run_human(ctx)
-    else:
-        raise RuntimeError(f"unknown mode: {mode!r}")
+    try:
+        if mode == "test":
+            run_test(ctx)
+        elif mode == "normal":
+            run_normal(ctx)
+        elif mode == "human":
+            run_human(ctx)
+        else:
+            raise RuntimeError(f"unknown mode: {mode!r}")
+    finally:
+        # Always release before process exit -> idle memory is freed.
+        _cleanup_gpu()
 
 
 # ------------------------------------------------------------------ helpers
@@ -589,24 +621,49 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
             setattr(_MVPipe, _m, lambda self: None)
     ctx.progress("mvadapter", 6.0, "loading SDXL + MV-Adapter (mps)")
     seed = ctx.seed if isinstance(ctx.seed, int) else 42
-    steps = int(spec.get("mv_steps", 50))
+    try:
+        steps = int(spec.get("mv_steps", 50))
+    except (TypeError, ValueError):
+        steps = 50
     # fp16 on MPS yields NaN in the custom MV attention (verified); fp32 is
     # required. 768px needs ~25GB; smaller Macs drop to 512px.
     from . import memguard as _mg
-    res = 768 if (_mg.total_bytes() or 0) >= 48 * 1024**3 else 512
-    res = int(spec.get("mv_resolution", res))
-    with _Heartbeat(ctx, "mvadapter", 9.0,
-                    f"synthesizing 6 views ({res}px fp32)..."):
-        pipe = prepare_pipeline(
-            base_model=str(base), vae_model=None, unet_model=None,
-            lora_model=None, adapter_path=str(adapter), scheduler=None,
-            num_views=6, device="mps", dtype=torch.float32)
-        images = run_pipeline(
-            pipe, num_views=6, text=str(spec.get("mv_prompt", "high quality")),
-            image=_PIL.open(front).convert("RGB"),
-            height=res, width=res,
-            num_inference_steps=steps, guidance_scale=5.0, seed=seed,
-            remove_bg_fn=None, device="mps", azimuth_deg=list(AZIMUTHS_6V))
+    total_b = _mg.total_bytes() or 0
+    res = 768 if total_b >= 48 * 1024**3 else 512
+    try:
+        res = int(spec.get("mv_resolution", res))
+    except (TypeError, ValueError):
+        pass
+    pipe = None
+    try:
+        with _Heartbeat(ctx, "mvadapter", 9.0,
+                        f"synthesizing 6 views ({res}px fp32)..."):
+            pipe = prepare_pipeline(
+                base_model=str(base), vae_model=None, unet_model=None,
+                lora_model=None, adapter_path=str(adapter), scheduler=None,
+                num_views=6, device="mps", dtype=torch.float32)
+            images = run_pipeline(
+                pipe, num_views=6, text=str(spec.get("mv_prompt", "high quality")),
+                image=_PIL.open(front).convert("RGB"),
+                height=res, width=res,
+                num_inference_steps=steps, guidance_scale=5.0, seed=seed,
+                remove_bg_fn=None, device="mps", azimuth_deg=list(AZIMUTHS_6V))
+    finally:
+        # Always release + remove CUDA stubs, even when synthesis fails,
+        # so later stages probe real modules and idle memory is freed.
+        try:
+            if pipe is not None:
+                del pipe
+        except Exception:
+            pass
+        _cleanup_gpu()
+        for _m in [m for m in _sys2.modules
+                   if m == "triton" or m.startswith(("triton.",
+                                                     "nvdiffrast"))]:
+            try:
+                del _sys2.modules[_m]
+            except KeyError:
+                pass
     ctx.check_cancel()
     outdir.mkdir(parents=True, exist_ok=True)
     outs = []
@@ -629,15 +686,7 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
         p = outdir / f"view{i:02d}.png"
         im.save(str(p))
         outs.append(p)
-    del pipe
-    torch.mps.empty_cache()
-    # Remove the CUDA stubs: later stages (TRELLIS flex_gemm) probe for
-    # real triton/nvdiffrast via try/except ImportError, which a lingering
-    # stub would defeat. Already-imported mvadapter modules keep working.
-    for _m in [m for m in _sys2.modules
-               if m == "triton" or m.startswith(("triton.",
-                                                 "nvdiffrast"))]:
-        del _sys2.modules[_m]
+    _cleanup_gpu()
     ctx.progress("mvadapter", 12.0, "6 views ready")
     return outs
 

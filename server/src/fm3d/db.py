@@ -78,6 +78,12 @@ class JobStore:
 
     def set_state(self, job_id: str, state: str, **fields: Any) -> None:
         assert state in VALID_STATES, state
+        allowed = {"stage", "progress", "eta_s", "error", "started_at",
+                   "finished_at", "worker_pid", "seed", "name", "mode",
+                   "spec_json", "queue_index"}
+        for k in fields:
+            if k not in allowed:
+                raise ValueError(f"invalid field: {k}")
         cols = ["state=?"]
         vals: list[Any] = [state]
         for k, v in fields.items():

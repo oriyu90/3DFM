@@ -1,5 +1,8 @@
 # torch + MLX runtime for the hun-human venv (macOS arm64).
 # Same torch pin as requirements-torch.txt plus MLX + diffusion extras.
+# NOTE (macOS 26 / 40GB+): keep resolver-friendly (>=, not ==) for the
+# fast-moving HF stack so a fresh setup resolves on day one. Torch itself
+# stays pinned (ABI fallback handled in setup.sh).
 torch==2.13.0
 torchvision==0.28.0
 mlx
@@ -13,7 +16,7 @@ fast_simplification
 opencv-python
 transformers>=4.57
 diffusers>=0.40.0
-accelerate==1.1.1
+accelerate>=1.1.1
 peft
 safetensors
 huggingface-hub

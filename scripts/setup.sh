@@ -14,6 +14,7 @@
 # Idempotent: safe to re-run; finished steps are skipped.
 # Exit 0 = setup complete (possibly with warnings), 1 = fatal.
 set -u
+set -o pipefail
 DATA_DIR="$HOME/Library/Application Support/3DFM"
 OUTPUT_DIR="$HOME/Pictures/3DFM"
 TIER=normal
@@ -48,6 +49,13 @@ NSTEPS=9
 FAILED=0
 
 mkdir -p "$DATA_DIR/logs" "$MODEL_DIR"
+# Rotate an unbounded setup.log so re-runs stay fast and parseable.
+if [[ -f "$LOG" ]]; then
+  _sz=$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null || echo 0)
+  if [[ "$_sz" -gt 20971520 ]]; then
+    mv -f "$LOG" "$LOG.old" 2>/dev/null || : >"$LOG"
+  fi
+fi
 exec 3>>"$LOG"
 
 emit() { # phase(0-100 weight) msg
@@ -79,6 +87,13 @@ need_tool() {
       log "installing uv..."
       curl -LsSf https://astral.sh/uv/install.sh | sh || die "uv install failed"
       export PATH="$HOME/.local/bin:$PATH"
+    elif [[ "$1" == "ninja" || "$1" == "cmake" || "$1" == "pkg-config" ]]; then
+      if command -v brew >/dev/null 2>&1; then
+        log "installing $1 via brew..."
+        brew install "$1" >>"$LOG" 2>&1 || die "brew install $1 に失敗。ログ: $LOG"
+      else
+        die "required tool missing: $1 (brew install $1)"
+      fi
     else
       die "required tool missing: $1"
     fi
@@ -87,10 +102,40 @@ need_tool() {
 
 [[ "$(uname -m)" == "arm64" ]] || die "Apple Silicon (arm64) required"
 
+# macOS version + memory preflight (40GB+ path is the primary target).
+MACOS_VER="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+MACOS_MAJOR="$(printf '%s' "$MACOS_VER" | cut -d. -f1)"
+log "macos: $MACOS_VER arch=$(uname -m)"
+if [[ "$MACOS_MAJOR" -lt 14 ]]; then
+  die "macOS 14以降が必要です (現在 $MACOS_VER)"
+fi
+TOTAL_GB=$(python3 -c 'import subprocess; print(int(subprocess.run(["sysctl","-n","hw.memsize"],capture_output=True,text=True).stdout.strip())//1024**3)' 2>/dev/null || echo 0)
+log "total memory: ${TOTAL_GB}GB tier=$TIER"
+if [[ "$TIER" == "human" || "$TIER" == "full" ]]; then
+  if [[ "$TOTAL_GB" -gt 0 && "$TOTAL_GB" -lt 40 ]]; then
+    log "warn: tier=$TIER は40GB+推奨ですが ${TOTAL_GB}GB で続行します (自動低下ガードが作動します)"
+  fi
+fi
+# Disk preflight: normal ~20GB, human/full ~60GB (models+runtimes+work).
+need_gb=20
+[[ "$TIER" == "human" || "$TIER" == "full" ]] && need_gb=60
+free_gb=$(df -g "$DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+log "disk free: ${free_gb}GB (need ~${need_gb}GB for tier=$TIER)"
+if [[ "$free_gb" -gt 0 && "$free_gb" -lt "$need_gb" ]]; then
+  if [[ "$TIER" == "none" ]]; then
+    log "warn: disk low but tier=none, continuing"
+  else
+    die "空き容量不足: ${free_gb}GB (tier=$TIER は約${need_gb}GB必要)。不要ファイルを整理して再実行してください"
+  fi
+fi
+
 # ---- 1. prerequisites -------------------------------------------------
 next_step "prereq" "前提ツールを確認しています"
 need_tool uv
 need_tool curl
+need_tool ninja
+need_tool cmake
+need_tool pkg-config
 export PATH="$HOME/.local/bin:$PATH"
 # Prefer full Xcode (Metal toolchain) when present; no sudo required since
 # we only export DEVELOPER_DIR for our own child processes.
@@ -129,8 +174,24 @@ mkvenv() { # name requirements-file
   if [[ -n "$req" && -f "$req" ]]; then
     log "installing deps for $name"
     # shellcheck disable=SC2086
-    uv pip install --python "$venv/bin/python" -r "$req" >>"$LOG" 2>&1 \
-      || die "依存の導入に失敗 ($name)。ログ: $LOG"
+    if ! uv pip install --python "$venv/bin/python" -r "$req" >>"$LOG" 2>&1; then
+      # torch ABI fallback (計画書 §2): 2.13.0/0.28.0 -> 2.11.0/0.26.0.
+      # macOS 26 SDK + py3.11 で上位pinが無い場合の救済。
+      if [[ "$name" == "trellis" || "$name" == "hun-human" ]]; then
+        log "warn: primary pins failed for $name, trying torch ABI fallback 2.11.0"
+        _tmp=$(mktemp)
+        sed -e 's/^torch==.*/torch==2.11.0/' -e 's/^torchvision==.*/torchvision==0.26.0/' "$req" >"$_tmp"
+        if uv pip install --python "$venv/bin/python" -r "$_tmp" >>"$LOG" 2>&1; then
+          log "fallback pins ok for $name"
+          rm -f "$_tmp"
+        else
+          rm -f "$_tmp"
+          die "依存の導入に失敗 ($name)。ログ: $LOG"
+        fi
+      else
+        die "依存の導入に失敗 ($name)。ログ: $LOG"
+      fi
+    fi
   fi
   "$venv/bin/python" -c "import sys; print('venv ok:', sys.version.split()[0])" >>"$LOG" 2>&1 \
     || die "venv $name の検証に失敗"
