@@ -232,6 +232,105 @@ class SettingsTest(unittest.TestCase):
         ok, _ = validate({"stall_timeout_s": 5})
         self.assertTrue(ok)
 
+    def test_models_dir_empty_is_default(self):
+        ok, _ = validate({"models_dir": ""})
+        self.assertTrue(ok)
+
+    def test_models_dir_rejects_relative_and_system(self):
+        for bad in ("relative/path", "/", "/System", "/Library",
+                    "a/../b", "/tmp/../etc"):
+            # "/tmp/../etc" contains ".." -> rejected; others absolute/system.
+            ok, msg = validate({"models_dir": bad})
+            self.assertFalse(ok, bad)
+            # Bilingual message (EN + JA).
+            self.assertIn("/", msg)
+
+    def test_models_dir_accepts_absolute(self):
+        ok, _ = validate({"models_dir": "/tmp/3DFM-models-test"})
+        self.assertTrue(ok)
+
+    def test_models_dir_rejects_unmounted_volume(self):
+        ok, msg = validate({"models_dir": "/Volumes/DefinitelyNotMountedXYZ/3DFM-models"})
+        self.assertFalse(ok)
+        self.assertIn("/", msg)
+
+    def test_old_settings_without_models_dir_still_load(self):
+        from fm3d.settings import load, DEFAULTS
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-settings-"))
+        p = tmp / "settings.json"
+        p.write_text(json.dumps({"output_dir": "/tmp/out", "port": 44931}),
+                     encoding="utf-8")
+        cfg = load(p)
+        self.assertEqual(cfg["models_dir"], "")
+        self.assertEqual(cfg["output_dir"], "/tmp/out")
+        self.assertEqual(set(DEFAULTS) >= set(cfg), True)
+
+
+class StorageTest(unittest.TestCase):
+    def test_validate_models_dir_blocks_collisions(self):
+        from fm3d import storage as _storage
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-storage-"))
+        root = tmp / "data"
+        (root / "models").mkdir(parents=True)
+        ok, _, _ = _storage.validate_models_dir_candidate(
+            str(tmp / "ext-models"), root)
+        self.assertTrue(ok)
+        ok, _, _ = _storage.validate_models_dir_candidate(
+            str(root), root)
+        self.assertFalse(ok)
+        ok, _, _ = _storage.validate_models_dir_candidate(
+            str(root / "venvs"), root)
+        self.assertFalse(ok)
+        # Unmounted external volume is refused (avoid fake mountpoint).
+        ok, msg, _ = _storage.validate_models_dir_candidate(
+            "/Volumes/DefinitelyNotMountedXYZ/M", root)
+        self.assertFalse(ok)
+        self.assertIn("/", msg)
+
+    def test_move_dir_contents_safe_roundtrip(self):
+        from fm3d import storage as _storage
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-move-"))
+        src = tmp / "src"
+        dst = tmp / "dst"
+        src.mkdir()
+        (src / "a.bin").write_bytes(b"x" * 4096)
+        (src / "sub").mkdir()
+        (src / "sub" / "b.bin").write_bytes(b"y" * 4096)
+        ok, _ = _storage.move_dir_contents_safe(src, dst)
+        self.assertTrue(ok)
+        self.assertTrue((dst / "a.bin").is_file())
+        self.assertTrue((dst / "sub" / "b.bin").is_file())
+        # Refuse merging into non-empty destination.
+        (src / "c.bin").write_bytes(b"z")
+        ok, _ = _storage.move_dir_contents_safe(src, dst)
+        # dst already has a.bin; src has c.bin (no collision) -> ok.
+        self.assertTrue(ok)
+        (src / "d.bin").write_bytes(b"w")
+        (dst / "d.bin").write_bytes(b"existing")
+        ok, _ = _storage.move_dir_contents_safe(src, dst)
+        self.assertFalse(ok)
+
+    def test_check_queue_idle_blocks_running(self):
+        from fm3d import storage as _storage
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-idle-"))
+        mgr = make_mgr(tmp)
+        ok, _ = _storage.check_queue_idle(mgr.store)
+        self.assertTrue(ok)
+        jid = mgr.create_job("n", "test", {}, [], None)
+        ok, msg = _storage.check_queue_idle(mgr.store)
+        self.assertFalse(ok)
+        self.assertIn("/", msg)  # bilingual
+        mgr.store.delete(jid)
+
+    def test_data_dirs_override(self):
+        from fm3d.paths import DataDirs, build_data_dirs
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-dirs-"))
+        d = build_data_dirs(tmp, "/tmp/custom-models-x")
+        self.assertEqual(str(d.models_dir), "/tmp/custom-models-x")
+        d2 = DataDirs(tmp)
+        self.assertTrue(str(d2.models_dir).endswith("/models"))
+        self.assertTrue(str(d2.runtimes_dir).endswith("/runtimes"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

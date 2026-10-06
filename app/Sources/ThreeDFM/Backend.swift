@@ -351,6 +351,197 @@ final class Backend: ObservableObject {
         }
         return (resp as? HTTPURLResponse)?.statusCode == 200
     }
+
+    // -- Storage locations (Settings > Storage / 設定＞ストレージ) ----
+    // Bilingual UI: every user-visible string carries JP + EN.
+
+    func storage() async -> StorageInfo? {
+        try? await get("storage")
+    }
+
+    /// Move model weights (server-side, no restart).
+    /// - path: absolute folder, or "" to revert to default.
+    /// - moveFiles: true = move existing weights; false = pointer-only.
+    /// Returns (ok, bilingual message).
+    func moveModels(path: String, moveFiles: Bool) async -> (Bool, String) {
+        var req = URLRequest(url: baseURL.appendingPathComponent("storage/models/move"),
+                             timeoutInterval: 3600)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        authed(&req)
+        req.httpBody = try? JSONSerialization.data(
+            withJSONObject: ["path": path, "move_files": moveFiles])
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            return (false, "サーバーに接続できません / Cannot reach the server")
+        }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            var serverMsg: String? = nil
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                serverMsg = obj["detail"] as? String
+            }
+            if serverMsg == nil {
+                serverMsg = String(data: data, encoding: .utf8)
+            }
+            return (false, serverMsg ?? "移動に失敗しました / Move failed")
+        }
+        await refreshJobsQuiet()
+        if path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return (true, "既定のモデルフォルダに戻しました / Reverted to the default models folder")
+        }
+        return (true, moveFiles
+            ? "モデルを移動しました / Models moved"
+            : "モデルフォルダを切り替えました（不足分はセットアップで取得） / Models folder switched (fetch missing via Setup)")
+    }
+
+    func validateDataDir(path: String) async -> String {
+        var req = URLRequest(url: baseURL.appendingPathComponent("storage/data/validate"),
+                             timeoutInterval: 30)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        authed(&req)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["path": path])
+        guard let (data, resp) = try? await URLSession.shared.data(for: req) else {
+            return "サーバーに接続できません / Cannot reach the server"
+        }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            var serverMsg: String? = nil
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                serverMsg = obj["detail"] as? String
+            }
+            if serverMsg == nil {
+                serverMsg = String(data: data, encoding: .utf8)
+            }
+            return serverMsg ?? "検証に失敗しました / Validation failed"
+        }
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let note = obj["note"] as? String {
+            return note
+        }
+        return "OK"
+    }
+
+    /// Switch the data folder (program files root). Offline operation:
+    /// stops the server, optionally moves existing data, persists the
+    /// pointer, then restarts. Must be called with no queued/running jobs.
+    /// Returns (ok, bilingual message). Never crashes: all errors are values.
+    func setDataDirAndRestart(path: String, moveExisting: Bool) async -> (Bool, String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !queuedJobs.isEmpty || activeJob != nil {
+            return (false, "キューにジョブがあるため変更できません（先に完了・削除してください） / Clear the queue before changing the data folder")
+        }
+        // Basic validation (server re-validates on next launch via probe).
+        if !trimmed.isEmpty {
+            if trimmed.contains("\0") {
+                return (false, "無効なパスです / Invalid path")
+            }
+            let url = URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+            if !url.path.hasPrefix("/") {
+                return (false, "絶対パスで指定してください / Use an absolute path")
+            }
+            if url.pathComponents.contains("..") {
+                return (false, "'..'は使えません / '..' is not allowed")
+            }
+            for blocked in ["/System", "/Library", "/Applications", "/bin",
+                            "/sbin", "/usr", "/etc", "/var", "/private"] {
+                if url.path == blocked {
+                    return (false, "システムフォルダには設定できません / System folders cannot be used")
+                }
+            }
+            // External volumes must be mounted; otherwise mkdir would create
+            // a fake mountpoint on the boot disk.
+            let comps = url.pathComponents
+            if comps.count >= 3 && comps[0] == "/" && comps[1] == "Volumes" {
+                let vol = "/Volumes/" + comps[2]
+                if !FileManager.default.fileExists(atPath: vol) {
+                    return (false, "外付けボリュームがマウントされていません: \(vol)（先に接続してください） / External volume not mounted: \(vol) (connect the drive first)")
+                }
+            }
+        }
+        let oldDir = Paths.dataDir
+        // Stop the server first (offline move: DB must be closed).
+        pollTask?.cancel()
+        serverProc?.terminate()
+        // Give the child a moment to drop server.pid / jobs.db-WAL.
+        try? await Task.sleep(for: .seconds(1.5))
+        serverProc = nil
+        serverUp = false
+        let newURL: URL = trimmed.isEmpty
+            ? Paths.defaultDataDir
+            : URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+        do {
+            try FileManager.default.createDirectory(
+                at: newURL, withIntermediateDirectories: true)
+            // Writability probe (create + delete, no data in RAM).
+            let probe = newURL.appendingPathComponent(".3dfm-write-test")
+            try "ok".write(to: probe, atomically: true, encoding: .utf8)
+            try? FileManager.default.removeItem(at: probe)
+        } catch {
+            // Restart with the old location so the app never strands.
+            launchServer()
+            return (false, "フォルダに書き込めません: \(error.localizedDescription) / Folder is not writable: \(error.localizedDescription)")
+        }
+        if moveExisting && !trimmed.isEmpty {
+            do {
+                let entries = try FileManager.default.contentsOfDirectory(
+                    at: oldDir, includingPropertiesForKeys: nil)
+                // Refuse merging into a non-empty destination.
+                let dstNames = Set((try? FileManager.default.contentsOfDirectory(
+                    at: newURL, includingPropertiesForKeys: nil)
+                    .map { $0.lastPathComponent }) ?? [])
+                for e in entries {
+                    if dstNames.contains(e.lastPathComponent) {
+                        throw NSError(domain: "3DFM", code: 409, userInfo: [
+                            NSLocalizedDescriptionKey:
+                            "移動先に '\(e.lastPathComponent)' が既にあります / Destination already has '\(e.lastPathComponent)'"])
+                    }
+                }
+                for e in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    let dst = newURL.appendingPathComponent(e.lastPathComponent)
+                    do {
+                        try FileManager.default.moveItem(at: e, to: dst)
+                    } catch {
+                        // Cross-volume fallback: copy + delete (streams,
+                        // never loads weights into RAM).
+                        var isDir: ObjCBool = false
+                        _ = FileManager.default.fileExists(atPath: e.path, isDirectory: &isDir)
+                        if isDir.boolValue {
+                            try FileManager.default.copyItem(at: e, to: dst)
+                            try FileManager.default.removeItem(at: e)
+                        } else {
+                            try FileManager.default.copyItem(at: e, to: dst)
+                            try FileManager.default.removeItem(at: e)
+                        }
+                    }
+                }
+            } catch {
+                try? Paths.setCustomDataDir(trimmed)
+                launchServer()
+                Task { await self.refreshJobsQuiet() }
+                return (false, "移動中に中断: \(error.localizedDescription)。移動済みは移動先に残ります / Move interrupted: \(error.localizedDescription). Already-moved items stay at the destination.")
+            }
+        }
+        do {
+            try Paths.setCustomDataDir(trimmed)
+        } catch {
+            launchServer()
+            return (false, "保存に失敗しました: \(error.localizedDescription) / Cannot save: \(error.localizedDescription)")
+        }
+        // Restart against the new location.
+        needsSetup = !FileManager.default.fileExists(atPath: Paths.probesFile.path)
+        launchServer()
+        pollTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                await self.refreshJobsQuiet()
+                let idle = await MainActor.run { self.activeJob == nil }
+                try? await Task.sleep(for: .seconds(idle ? 3 : 1))
+            }
+        }
+        await waitForHealth()
+        return (true, trimmed.isEmpty
+            ? "既定のデータフォルダに戻しました（再起動済み） / Reverted to the default data folder (restarted)"
+            : "データフォルダを切り替え再起動しました / Data folder switched and restarted")
+    }
 }
 
 enum BackendError: Error {

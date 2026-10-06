@@ -4,6 +4,8 @@
 # and parses JSONL progress lines on stdout.
 #
 #   --data-dir DIR     runtime root (default ~/Library/Application Support/3DFM)
+#   --models-dir DIR   model weights folder (default <data-dir>/models).
+#                      Empty = default. Persisted to settings.json `models_dir`.
 #   --output-dir DIR   model output folder (written to settings.json)
 #   --models TIER      none | normal | human | full   (default normal)
 #   --hf-token TOKEN   Hugging Face token for gated repos (or HF_TOKEN env).
@@ -16,6 +18,7 @@
 set -u
 set -o pipefail
 DATA_DIR="$HOME/Library/Application Support/3DFM"
+MODELS_DIR_ARG=""
 OUTPUT_DIR="$HOME/Pictures/3DFM"
 TIER=normal
 REINSTALL=0
@@ -25,6 +28,7 @@ HF_TOKEN_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --data-dir) DATA_DIR="$2"; shift 2;;
+    --models-dir) MODELS_DIR_ARG="$2"; shift 2;;
     --output-dir) OUTPUT_DIR="$2"; shift 2;;
     --models) TIER="$2"; shift 2;;
     --hf-token) HF_TOKEN_ARG="$2"; shift 2;;
@@ -42,7 +46,11 @@ unset HF_TOKEN_ARG
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$DATA_DIR/venvs"
-MODEL_DIR="$DATA_DIR/models"
+if [[ -n "$MODELS_DIR_ARG" ]]; then
+  MODEL_DIR="$MODELS_DIR_ARG"
+else
+  MODEL_DIR="$DATA_DIR/models"
+fi
 LOG="$DATA_DIR/logs/setup.log"
 STEP=0
 NSTEPS=9
@@ -120,12 +128,22 @@ fi
 need_gb=20
 [[ "$TIER" == "human" || "$TIER" == "full" ]] && need_gb=60
 free_gb=$(df -g "$DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
-log "disk free: ${free_gb}GB (need ~${need_gb}GB for tier=$TIER)"
+log "disk free: ${free_gb}GB (need ~${need_gb}GB for tier=$TIER) data_dir=$DATA_DIR models_dir=$MODEL_DIR"
 if [[ "$free_gb" -gt 0 && "$free_gb" -lt "$need_gb" ]]; then
   if [[ "$TIER" == "none" ]]; then
     log "warn: disk low but tier=none, continuing"
   else
     die "空き容量不足: ${free_gb}GB (tier=$TIER は約${need_gb}GB必要)。不要ファイルを整理して再実行してください"
+  fi
+fi
+# When models live on another volume, check that volume too.
+if [[ "$MODEL_DIR" != "$DATA_DIR/models" && "$MODEL_DIR" != "$DATA_DIR"/models ]]; then
+  mfree_gb=$(df -g "$MODEL_DIR" 2>/dev/null | awk 'NR==2{print $4}' || df -g "$(dirname "$MODEL_DIR")" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+  log "models volume free: ${mfree_gb}GB (models_dir=$MODEL_DIR)"
+  if [[ "$mfree_gb" -gt 0 && "$mfree_gb" -lt "$need_gb" ]]; then
+    if [[ "$TIER" != "none" ]]; then
+      die "モデルフォルダの空き容量不足: ${mfree_gb}GB (tier=$TIER は約${need_gb}GB必要)。別の場所を指定するか整理して再実行してください"
+    fi
   fi
 fi
 
@@ -209,6 +227,7 @@ esac
 # ---- 5. probes ------------------------------------------------------------
 next_step "probes" "GPU・メモリ・容量を診断しています"
 "$VENV_DIR/server/bin/python" "$SCRIPT_DIR/probe.py" --data-dir "$DATA_DIR" \
+  --models-dir "$MODEL_DIR" \
   || die "診断(probe)に失敗。ログ: $LOG"
 
 # ---- 6. models --------------------------------------------------------------
@@ -250,9 +269,16 @@ esac
 # ---- 7. settings -------------------------------------------------------------
 next_step "settings" "設定を保存しています"
 mkdir -p "$OUTPUT_DIR" || die "出力フォルダを作成できません: $OUTPUT_DIR"
-"$VENV_DIR/server/bin/python" - "$DATA_DIR" "$OUTPUT_DIR" <<'EOF' >>"$LOG" 2>&1 || exit 1
-import json, sys
-data_dir, out = sys.argv[1], sys.argv[2]
+mkdir -p "$MODEL_DIR" || die "モデルフォルダを作成できません: $MODEL_DIR"
+MODELS_DIR_FOR_SETTINGS="$MODELS_DIR_ARG"
+DATA_DIR_FOR_SETTINGS="$DATA_DIR"
+OUTPUT_DIR_FOR_SETTINGS="$OUTPUT_DIR"
+export MODELS_DIR_FOR_SETTINGS DATA_DIR_FOR_SETTINGS OUTPUT_DIR_FOR_SETTINGS
+"$VENV_DIR/server/bin/python" - <<'EOF' >>"$LOG" 2>&1 || exit 1
+import json, os
+data_dir = os.environ["DATA_DIR_FOR_SETTINGS"]
+out = os.environ["OUTPUT_DIR_FOR_SETTINGS"]
+models_arg = os.environ.get("MODELS_DIR_FOR_SETTINGS", "")
 p = f"{data_dir}/settings.json"
 cfg = {}
 try:
@@ -261,10 +287,14 @@ try:
 except (OSError, ValueError):
     pass
 cfg["output_dir"] = out
+# Persist custom models location ("" = default <data_dir>/models).
+# Kept compatible: old installs without the key behave as default.
+cfg["models_dir"] = models_arg.strip() if isinstance(models_arg, str) else ""
 with open(p, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-print("settings ok:", out)
+print("settings ok:", out, "models_dir=", cfg["models_dir"] or "<default>")
 EOF
+unset MODELS_DIR_FOR_SETTINGS DATA_DIR_FOR_SETTINGS OUTPUT_DIR_FOR_SETTINGS
 
 # ---- 8. verify ------------------------------------------------------------------
 next_step "verify" "最終検証しています"

@@ -77,18 +77,29 @@ def venv_probe(python: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
+    ap.add_argument("--models-dir", default="",
+                    help="model weights folder (default <data-dir>/models)")
     ns = ap.parse_args()
     data = Path(ns.data_dir).expanduser()
     data.mkdir(parents=True, exist_ok=True)
+    models = Path(ns.models_dir).expanduser() if str(ns.models_dir or "").strip() \
+        else data / "models"
     venvs = data / "venvs"
 
     code, metal = run(["xcrun", "-sdk", "macosx", "metal", "--version"])
+    try:
+        models_free = round((shutil.disk_usage(
+            str(models if models.exists() else data)).free) / 1024**3, 1)
+    except OSError:
+        models_free = -1.0
     result = {
         "arch": platform.machine(),
         "macos": platform.mac_ver()[0],
         "mem_total_gb": total_mem_gb(),
         "mem_free_gb": vm_free_gb(),
         "disk_free_gb": round((shutil.disk_usage(str(data)).free) / 1024**3, 1),
+        "models_dir": str(models),
+        "models_free_gb": models_free,
         "metal_toolchain": code == 0,
         "metal_version": metal.splitlines()[0] if metal else "",
         "venvs": {name: venv_probe(venvs / name / "bin" / "python")

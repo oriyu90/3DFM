@@ -398,6 +398,12 @@ class JobManager:
             return
         env = dict(os.environ)
         env["FM3D_DATA_DIR"] = str(self.dirs.root)
+        # Effective models dir (custom location support): workers resolve
+        # the same path via env first, so GUI/CLI/server/worker agree.
+        try:
+            env["FM3D_MODELS_DIR"] = str(self.dirs.models_dir)
+        except (OSError, RuntimeError, ValueError):
+            pass
         # Pipeline-internal downloads (DINOv3 etc.) stay inside our data dir
         # and work offline once fetched.
         env["HF_HUB_CACHE"] = str(self.dirs.models_dir / ".hf-cache")

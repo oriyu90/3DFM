@@ -23,7 +23,7 @@ from . import memguard
 from . import __version__ as _server_version
 from .db import JobStore
 from .manager import JobManager
-from .paths import DataDirs, resolve_data_dir
+from .paths import DataDirs, build_data_dirs, resolve_data_dir
 from .settings import load as load_settings
 from .settings import save as save_settings
 from .settings import validate as validate_settings
@@ -106,9 +106,17 @@ def _apply_retention(dirs: DataDirs, store: JobStore,
 
 
 def create_app() -> FastAPI:
-    dirs = resolve_data_dir().expanduser()
-    dirs = DataDirs(dirs).ensure()
-    settings = load_settings(dirs.settings_path)
+    data_root = resolve_data_dir().expanduser()
+    # Load settings first so a saved models_dir override takes effect.
+    # build_data_dirs honors FM3D_MODELS_DIR env > settings value.
+    tmp_settings_path = DataDirs(data_root).settings_path
+    settings = load_settings(tmp_settings_path)
+    dirs = build_data_dirs(
+        data_root, str(settings.get("models_dir", "") or "")).ensure()
+    # If settings lacked models_dir (pre-v0.3.0), keep it default-empty
+    # so old installs behave identically.
+    if "models_dir" not in settings:
+        settings["models_dir"] = ""
     token = _read_token(dirs.token_path)
     store = JobStore(dirs.db_path)
     app = FastAPI(title="3DFM", version=_server_version,
@@ -382,11 +390,227 @@ def create_app() -> FastAPI:
         if not ok:
             raise HTTPException(422, msg)
         app.state.settings.update(patch)
+        # When models_dir changes via plain settings (pointer-only, no
+        # file move), refresh the resolved dirs so subsequent
+        # /models/status and workers use the new location immediately.
+        # The caller is responsible for moving files or re-running
+        # Setup / models ensure; missing weights surface as usual.
+        if "models_dir" in patch:
+            from .paths import DataDirs as _DataDirs
+            try:
+                raw_value = str(app.state.settings.get("models_dir", "") or "")
+                override = (Path(raw_value).expanduser()
+                            if raw_value.strip() else None)
+                new_dirs = _DataDirs(app.state.dirs.root, override)
+                new_dirs.ensure()
+                app.state.dirs = new_dirs
+                try:
+                    app.state.mgr.dirs = new_dirs
+                except (AttributeError, TypeError):
+                    pass
+                # Keep process env in sync so DataDirs (env-first when
+                # override is None) and future workers agree.
+                if override is None:
+                    os.environ.pop("FM3D_MODELS_DIR", None)
+                else:
+                    os.environ["FM3D_MODELS_DIR"] = str(new_dirs.models_dir)
+            except (OSError, RuntimeError) as e:
+                raise HTTPException(
+                    500, f"cannot prepare models folder: {e} / "
+                         f"モデルフォルダを準備できません: {e}")
         try:
             save_settings(app.state.dirs.settings_path, app.state.settings)
         except OSError as e:
             raise HTTPException(500, f"cannot save settings: {e}")
         return app.state.settings
+
+    @app.get("/storage", dependencies=[Depends(authed)])
+    def storage_status():
+        """Where program files live + usage. GUI and CLI share this."""
+        from . import storage as _storage
+        from .paths import default_data_dir as _default_root
+        dirs = app.state.dirs
+        info = _storage.storage_status(
+            dirs.root, dirs.models_dir,
+            str(app.state.settings.get("output_dir", "")))
+        try:
+            default_root = str(_default_root())
+        except Exception:
+            default_root = ""
+        try:
+            default_models = str(Path(default_root) / "models") \
+                if default_root else ""
+        except (OSError, RuntimeError):
+            default_models = ""
+        info["default_data_dir"] = default_root
+        info["default_models_dir"] = default_models
+        info["is_default_data"] = (
+            os.path.normpath(info["data_dir"]) == os.path.normpath(default_root)
+            if default_root else True)
+        # is_default_models: empty setting + default location, or env unset
+        # and path equals <data>/models. Compute lexically (no resolve).
+        try:
+            configured = str(app.state.settings.get("models_dir", "") or "")
+            info["configured_models_dir"] = configured
+            info["is_default_models"] = (
+                configured.strip() == "" and
+                os.path.normpath(info["models_dir"]) ==
+                os.path.normpath(os.path.join(info["data_dir"], "models")))
+        except (OSError, RuntimeError, ValueError):
+            info["configured_models_dir"] = ""
+            info["is_default_models"] = True
+        return info
+
+    @app.post("/storage/data/validate", dependencies=[Depends(authed)])
+    def storage_data_validate(body: dict | None = None):
+        """Pre-check a data-dir candidate (no changes)."""
+        from . import storage as _storage
+        path = ""
+        if isinstance(body, dict):
+            path = str(body.get("path", "") or "")
+        ok, msg, normalized = _storage.validate_data_dir_candidate(
+            path, app.state.dirs.root, app.state.dirs.models_dir)
+        if not ok:
+            # Empty path means "revert to default": report default plan.
+            if path.strip() == "":
+                from .paths import default_data_dir as _default_root
+                try:
+                    default_root = _default_root()
+                except Exception:
+                    raise HTTPException(500, "cannot resolve default")
+                return {"ok": True, "path": str(default_root),
+                        "mode": "revert-to-default",
+                        "note": "Restart the app to apply / "
+                                "適用にはアプリの再起動が必要です"}
+            raise HTTPException(422, msg)
+        assert normalized is not None
+        # Space + writability pre-check (no filesystem changes yet except
+        # probing the destination parent for writability is avoided here;
+        # the offline mover re-checks with a write probe).
+        free = _storage.disk_free_bytes(normalized)
+        need = _storage.dir_size_bytes(app.state.dirs.root)
+        return {"ok": True, "path": str(normalized),
+                "mode": "move-offline",
+                "data_size_bytes": int(need),
+                "free_bytes": int(free),
+                "note": "Stop the server, move offline, then restart / "
+                        "サーバー停止後にオフライン移動し再起動してください"}
+
+    @app.post("/storage/models/move", dependencies=[Depends(authed)])
+    def storage_models_move(body: dict | None = None):
+        """Move model weights to a new folder (or switch pointer).
+
+        Body: {"path": "<absolute>", "move_files": true}
+        - move_files=true (default): validate, require idle queue,
+          move <current>/... contents to the new folder, then switch
+          settings pointer atomically. Crash-safe: source entries are
+          deleted only after their copy verifies.
+        - move_files=false: pointer-only switch (no file move). Use when
+          the folder was moved manually or a fresh empty folder + later
+          `models ensure` re-download is intended.
+        - path="" : revert to default <data_dir>/models (pointer-only).
+        """
+        from . import storage as _storage
+        from .paths import DataDirs as _DataDirs
+        path = ""
+        move_files = True
+        if isinstance(body, dict):
+            path = str(body.get("path", "") or "")
+            if "move_files" in body:
+                move_files = bool(body.get("move_files"))
+        idle_ok, idle_msg = _storage.check_queue_idle(app.state.store)
+        if not idle_ok:
+            raise HTTPException(409, idle_msg)
+        ok, msg, normalized = _storage.validate_models_dir_candidate(
+            path, app.state.dirs.root)
+        if not ok:
+            raise HTTPException(422, msg)
+        old_models = app.state.dirs.models_dir
+        if normalized is None:
+            # Revert to default.
+            app.state.settings["models_dir"] = ""
+            try:
+                new_dirs = _DataDirs(app.state.dirs.root, None)
+                new_dirs.ensure()
+                app.state.dirs = new_dirs
+                try:
+                    app.state.mgr.dirs = new_dirs
+                except (AttributeError, TypeError):
+                    pass
+                os.environ.pop("FM3D_MODELS_DIR", None)
+                save_settings(app.state.dirs.settings_path,
+                              app.state.settings)
+            except OSError as e:
+                raise HTTPException(500, f"cannot save settings: {e}")
+            return {"ok": True, "models_dir": str(new_dirs.models_dir),
+                    "mode": "reverted-to-default"}
+        assert normalized is not None
+        try:
+            if os.path.normpath(str(old_models)) == os.path.normpath(str(normalized)):
+                return {"ok": True, "models_dir": str(old_models),
+                        "mode": "no-change"}
+        except (OSError, RuntimeError, ValueError):
+            pass
+        if not move_files:
+            ok_w, msg_w = _storage._ensure_writable_dir(normalized)
+            if not ok_w:
+                raise HTTPException(422, msg_w)
+            app.state.settings["models_dir"] = str(normalized)
+            try:
+                new_dirs = _DataDirs(app.state.dirs.root, normalized)
+                new_dirs.ensure()
+                app.state.dirs = new_dirs
+                try:
+                    app.state.mgr.dirs = new_dirs
+                except (AttributeError, TypeError):
+                    pass
+                os.environ["FM3D_MODELS_DIR"] = str(normalized)
+                save_settings(app.state.dirs.settings_path,
+                              app.state.settings)
+            except OSError as e:
+                raise HTTPException(500, f"cannot save settings: {e}")
+            return {"ok": True, "models_dir": str(normalized),
+                    "mode": "pointer-only"}
+        # move_files=True: space pre-check, then move contents.
+        need = _storage.dir_size_bytes(old_models) \
+            if old_models.is_dir() else 0
+        free = _storage.disk_free_bytes(normalized)
+        if free >= 0 and need > 0 and free < need:
+            raise HTTPException(
+                422,
+                f"not enough free space (need {need/1024**3:.1f} GB, "
+                f"free {free/1024**3:.1f} GB) / "
+                f"空き容量不足（必要 {need/1024**3:.1f} GB、"
+                f"空き {free/1024**3:.1f} GB）")
+        ok_w, msg_w = _storage._ensure_writable_dir(normalized)
+        if not ok_w:
+            raise HTTPException(422, msg_w)
+        if old_models.is_dir():
+            ok_m, msg_m = _storage.move_dir_contents_safe(old_models,
+                                                          normalized)
+            if not ok_m:
+                raise HTTPException(500, msg_m)
+        app.state.settings["models_dir"] = str(normalized)
+        try:
+            new_dirs = _DataDirs(app.state.dirs.root, normalized)
+            new_dirs.ensure()
+            app.state.dirs = new_dirs
+            try:
+                app.state.mgr.dirs = new_dirs
+            except (AttributeError, TypeError):
+                pass
+            save_settings(app.state.dirs.settings_path,
+                          app.state.settings)
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"files moved but cannot save settings: {e} / "
+                f"ファイルは移動済みですが設定を保存できません: {e}")
+        # Propagate to subsequently spawned workers via env as well so
+        # already-computed absolute paths agree immediately.
+        os.environ["FM3D_MODELS_DIR"] = str(normalized)
+        return {"ok": True, "models_dir": str(normalized),
+                "mode": "moved"}
 
     return app
 

@@ -308,6 +308,8 @@ struct SetupWizardView: View {
         (NSSearchPathForDirectoriesInDomains(.picturesDirectory,
                                              .userDomainMask, true).first
             .map { $0 + "/3DFM" }) ?? "~/Pictures/3DFM"
+    @State private var dataDir = Paths.dataDir.path
+    @State private var modelsDir = ""
     @State private var tier = "normal"
     @State private var hfToken = HFTokenStore.load()
     @State private var rememberToken = true
@@ -315,20 +317,37 @@ struct SetupWizardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("3DFM セットアップ").font(.title2)
-            Text("出力フォルダを選んで「セットアップ開始」を押すだけです。ランタイム・AIモデルは自動で導入されます (初回は数十分かかることがあります)。")
+            Text("3DFM セットアップ / Setup").font(.title2)
+            Text("出力フォルダを選んで「セットアップ開始」を押すだけです。ランタイム・AIモデルは自動で導入されます (初回は数十分かかることがあります)。 / Choose an output folder and press Start. Runtimes and AI models are installed automatically (first run may take tens of minutes).")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
-                TextField("出力フォルダ", text: $outputDir)
+                TextField("出力フォルダ / Output folder", text: $outputDir)
                     .textFieldStyle(.roundedBorder)
-                Button("選択…", action: pickDir)
+                Button("選択… / Choose…", action: pickDir)
             }
-            Picker("モデル", selection: $tier) {
+            DisclosureGroup("保存場所の詳細 / Storage details (data & models)") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        TextField("データフォルダ / Data folder (program files)", text: $dataDir)
+                            .textFieldStyle(.roundedBorder)
+                        Button("選択…", action: pickDataDir)
+                    }
+                    HStack {
+                        TextField("モデルフォルダ / Models folder (空=既定 / empty=default)", text: $modelsDir)
+                            .textFieldStyle(.roundedBorder)
+                        Button("選択…", action: pickModelsDir)
+                        Button("既定 / Default") { modelsDir = "" }
+                    }
+                    Text("データフォルダには venv・ランタイム・ジョブDBが入ります（venvs は絶対パスのためデータフォルダ内に固定）。モデル（約16〜60GB）のみ外付けSSD等に分離できます。 / Data folder holds venvs, runtimes and job DB (venvs stay inside it). Only models (~16–60 GB) can be separated to an external SSD.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.font(.callout)
+            Picker("モデル / Models", selection: $tier) {
                 Text("普通 (~16GB)").tag("normal")
                 Text("人物込み (~35GB)").tag("human")
                 Text("フル (humanと同等)").tag("full")
             }.pickerStyle(.segmented)
-            Text("40GB+メモリのMacでは human/full を推奨。CLI `3dfm models ensure --tier human` と同一内容です。")
+            Text("40GB+メモリのMacでは human/full を推奨。CLI `3dfm models ensure --tier human` と同一内容です。 / 40 GB+ Macs should use human/full. Same as CLI `3dfm models ensure --tier human`.")
                 .font(.caption).foregroundStyle(.secondary)
             DisclosureGroup("Hugging Face トークン (ゲート付きモデル用・任意)") {
                 SecureField("hf_... (同意済みトークン)", text: $hfToken)
@@ -353,21 +372,31 @@ struct SetupWizardView: View {
             HStack {
                 Spacer()
                 if runner.done {
-                    Button("閉じる") {
+                    Button("閉じる / Close") {
                         backend.needsSetup = false
                         backend.launchServer()
                         Task { await backend.waitForHealth() }
                         dismiss()
                     }.keyboardShortcut(.defaultAction)
                 } else {
-                    Button("セットアップ開始") {
+                    Button("セットアップ開始 / Start setup") {
                         let tok = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
                         if rememberToken {
                             HFTokenStore.save(tok)
                         } else if !tok.isEmpty {
                             HFTokenStore.delete()
                         }
-                        runner.start(outputDir: outputDir, tier: tier,
+                        // Persist the chosen data location before setup so
+                        // the server and CLI agree (UserDefaults + pointer).
+                        let d = dataDir.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !d.isEmpty && d != Paths.defaultDataDir.path {
+                            try? Paths.setCustomDataDir(d)
+                        } else if d.isEmpty || d == Paths.defaultDataDir.path {
+                            try? Paths.setCustomDataDir("")
+                        }
+                        runner.start(dataDir: d.isEmpty ? Paths.dataDir.path : d,
+                                     modelsDir: modelsDir.trimmingCharacters(in: .whitespacesAndNewlines),
+                                     outputDir: outputDir, tier: tier,
                                      hfToken: tok)
                     }
                     .keyboardShortcut(.defaultAction)
@@ -389,6 +418,28 @@ struct SetupWizardView: View {
         }
     }
 
+    private func pickDataDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            dataDir = url.path
+        }
+    }
+
+    private func pickModelsDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            modelsDir = url.path
+        }
+    }
+
 }
 
 // MARK: - Setup runner (owns the setup.sh child process)
@@ -400,7 +451,7 @@ final class SetupRunner: ObservableObject {
     @Published var done = false
     @Published var failed = ""
 
-    func start(outputDir: String, tier: String, hfToken: String) {
+    func start(dataDir: String, modelsDir: String, outputDir: String, tier: String, hfToken: String) {
         running = true
         failed = ""
         done = false
@@ -413,11 +464,16 @@ final class SetupRunner: ObservableObject {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/bash")
             let script = Paths.scripts.appendingPathComponent("setup.sh").path
-            proc.arguments = [script,
-                              "--data-dir", Paths.dataDir.path,
-                              "--output-dir",
-                              (outputDir as NSString).expandingTildeInPath,
-                              "--models", tier]
+            var args = [script,
+                        "--data-dir", (dataDir as NSString).expandingTildeInPath,
+                        "--output-dir",
+                        (outputDir as NSString).expandingTildeInPath,
+                        "--models", tier]
+            let m = modelsDir.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !m.isEmpty {
+                args += ["--models-dir", (m as NSString).expandingTildeInPath]
+            }
+            proc.arguments = args
             var env = ProcessInfo.processInfo.environment
             let tok = hfToken.isEmpty ? HFTokenStore.load() : hfToken
             if !tok.isEmpty { env["HF_TOKEN"] = tok }
@@ -506,11 +562,13 @@ struct SettingsPanes: View {
     var body: some View {
         TabView {
             GeneralSettingsPane()
-                .tabItem { Label("一般", systemImage: "gear") }
+                .tabItem { Label("一般 / General", systemImage: "gear") }
+            StorageSettingsPane()
+                .tabItem { Label("ストレージ / Storage", systemImage: "externaldrive.fill") }
             ModelsSettingsPane()
-                .tabItem { Label("モデル", systemImage: "cube.fill") }
+                .tabItem { Label("モデル / Models", systemImage: "cube.fill") }
         }
-        .frame(width: 580, height: 460)
+        .frame(width: 620, height: 520)
     }
 }
 
@@ -619,7 +677,190 @@ struct GeneralSettingsPane: View {
                 "port": Int(port) ?? 44931,
                 "notify": notify,
             ])
-            saved = ok ? "保存しました" : "保存に失敗しました (値をCLI `3dfm settings get` と比較してください)"
+            saved = ok ? "保存しました / Saved" : "保存に失敗しました (値をCLI `3dfm settings get` と比較してください) / Save failed (compare with CLI `3dfm settings get`)"
+        }
+    }
+}
+
+// MARK: - Storage locations (data + models folders)
+
+struct StorageSettingsPane: View {
+    @EnvironmentObject var backend: Backend
+    @State private var info: StorageInfo?
+    @State private var dataDir = ""
+    @State private var modelsDir = ""
+    @State private var moveDataFiles = true
+    @State private var moveModelFiles = true
+    @State private var busy = false
+    @State private var message = ""
+    @State private var isDefaultData = true
+    @State private var isDefaultModels = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("プログラムファイルの保存場所 / Where program files live")
+                .font(.headline)
+            Text("データフォルダには venv・ランタイム・ジョブDBが入ります（venvs は絶対パスのため移動はデータフォルダごと）。モデル（約16〜60GB）のみ外付けSSD等へ分離できます。変更前にキューを空にしてください。 / Data folder holds venvs, runtimes and the job DB (venvs stay inside it). Only models (~16–60 GB) can live on an external SSD. Empty the queue before changing locations.")
+                .font(.callout).foregroundStyle(.secondary)
+            if let info {
+                HStack {
+                    Text("使用量 / Usage:").font(.caption)
+                    Text("データ \(String(format: "%.1f", info.data_size_gb ?? 0)) GB / Data \(String(format: "%.1f", info.data_size_gb ?? 0)) GB")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("モデル \(String(format: "%.1f", info.models_size_gb ?? 0)) GB / Models \(String(format: "%.1f", info.models_size_gb ?? 0)) GB")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("空き \(String(format: "%.1f", info.free_gb ?? 0)) GB / Free \(String(format: "%.1f", info.free_gb ?? 0)) GB")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Divider()
+            Text("データフォルダ / Data folder (program files root)").font(.callout)
+            HStack {
+                TextField(Paths.defaultDataDir.path, text: $dataDir)
+                    .textFieldStyle(.roundedBorder)
+                Button("選択… / Choose…", action: pickData)
+                    .disabled(busy)
+                Button("既定に戻す / Reset", action: resetData)
+                    .disabled(busy)
+            }
+            .font(.callout)
+            Toggle("既存データを移動する / Move existing data", isOn: $moveDataFiles)
+                .font(.callout)
+            HStack {
+                Button(busy ? "適用中… / Applying…" : "データフォルダを適用・再起動 / Apply data folder + restart") {
+                    applyData()
+                }
+                .disabled(busy || dataDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("開く / Open") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: dataDir.isEmpty ? Paths.dataDir.path : dataDir))
+                }
+                .disabled(busy)
+            }
+            .font(.callout)
+            Divider()
+            Text("モデルフォルダ / Models folder (AI weights, 空=既定 / empty=default)").font(.callout)
+            HStack {
+                TextField("<既定> <data>/models / <default>", text: $modelsDir)
+                    .textFieldStyle(.roundedBorder)
+                Button("選択… / Choose…", action: pickModels)
+                    .disabled(busy)
+                Button("既定に戻す / Reset", action: resetModels)
+                    .disabled(busy)
+            }
+            .font(.callout)
+            Toggle("既存モデルを移動する / Move existing models (off=切替のみ / pointer-only)", isOn: $moveModelFiles)
+                .font(.callout)
+            HStack {
+                Button(busy ? "適用中… / Applying…" : "モデルフォルダを適用 / Apply models folder") {
+                    applyModels()
+                }
+                .disabled(busy)
+                Button("開く / Open") {
+                    let p = modelsDir.trimmingCharacters(in: .whitespacesAndNewlines)
+                    NSWorkspace.shared.open(URL(fileURLWithPath: p.isEmpty ? (info?.models_dir ?? Paths.dataDir.appendingPathComponent("models").path) : p))
+                }
+                .disabled(busy)
+            }
+            .font(.callout)
+            if !message.isEmpty {
+                Text(message).font(.callout).foregroundStyle(.secondary).lineLimit(4)
+            }
+            Spacer()
+            Text("CLI と同一操作: `3dfm storage status` / `3dfm storage move-models <path>` / `3dfm storage set-data-dir <path> --move` / Same operations as CLI.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(18)
+        .task { await refresh() }
+    }
+
+    private func refresh() async {
+        if let st = await backend.storage() {
+            info = st
+            dataDir = st.data_dir
+            let cfg = (st.configured_models_dir ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            modelsDir = cfg
+            isDefaultData = st.is_default_data ?? true
+            isDefaultModels = st.is_default_models ?? true
+        } else {
+            dataDir = Paths.dataDir.path
+            modelsDir = ""
+        }
+    }
+
+    private func pickData() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            dataDir = url.path
+        }
+    }
+
+    private func pickModels() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            modelsDir = url.path
+        }
+    }
+
+    private func resetData() {
+        dataDir = Paths.defaultDataDir.path
+        moveDataFiles = false
+        Task {
+            busy = true
+            message = "既定に戻しています… / Reverting to default…"
+            let (ok, msg) = await backend.setDataDirAndRestart(path: "", moveExisting: false)
+            message = msg
+            busy = false
+            if ok { await refresh() }
+        }
+    }
+
+    private func resetModels() {
+        modelsDir = ""
+        Task {
+            busy = true
+            message = "既定に戻しています… / Reverting to default…"
+            let (_, msg) = await backend.moveModels(path: "", moveFiles: false)
+            message = msg
+            busy = false
+            await refresh()
+        }
+    }
+
+    private func applyData() {
+        let target = dataDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        if target.isEmpty {
+            message = "データフォルダを入力してください / Enter a data folder"
+            return
+        }
+        busy = true
+        message = "切り替え中…（サーバー再起動あり） / Switching… (server restarts)"
+        Task {
+            let (ok, msg) = await backend.setDataDirAndRestart(path: target, moveExisting: moveDataFiles)
+            message = msg
+            busy = false
+            if ok { await refresh() }
+            _ = ok
+        }
+    }
+
+    private func applyModels() {
+        let target = modelsDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        busy = true
+        message = "モデルフォルダを切り替え中…（数分かかることがあります） / Switching models folder… (may take minutes)"
+        Task {
+            let (ok, msg) = await backend.moveModels(path: target, moveFiles: moveModelFiles)
+            message = msg
+            busy = false
+            await refresh()
+            _ = ok
         }
     }
 }
@@ -678,7 +919,9 @@ struct ModelsSettingsPane: View {
                 Spacer()
             }
             .font(.callout)
-            Text("CLI `3dfm models ensure --tier human` と同一操作です。")
+            Text("CLI `3dfm models ensure --tier human` と同一操作です。 / Same as CLI `3dfm models ensure --tier human`.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("保存場所の変更は「ストレージ / Storage」タブで行います（モデル・データフォルダ）。 / Change locations in the “Storage” tab (models & data folders).")
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
             HStack {

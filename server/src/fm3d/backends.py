@@ -69,8 +69,12 @@ def run(ctx: Ctx, mode: str, name: str) -> None:
 
 # ------------------------------------------------------------------ helpers
 def models_root() -> Path:
-    from .paths import resolve_data_dir
-    return resolve_data_dir() / "models"
+    from .paths import resolve_data_dir, resolve_models_dir
+    try:
+        return resolve_models_dir(resolve_data_dir())
+    except Exception:
+        from .paths import resolve_data_dir as _dd
+        return _dd() / "models"
 
 
 def require_dir(path: Path, hint: str) -> Path:

@@ -16,10 +16,53 @@ import urllib.request
 from pathlib import Path
 
 
+def _read_plist_data_dir() -> Path | None:
+    """Read Swift @AppStorage customDataDir (stdlib only, never raises)."""
+    try:
+        import plistlib
+        plist = Path.home() / "Library" / "Preferences" / "local.3dfm.app.plist"
+        if not plist.is_file():
+            return None
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        raw = data.get("customDataDir", "") if isinstance(data, dict) else ""
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return Path(raw.strip()).expanduser()
+    except Exception:
+        return None
+
+
+def _read_pointer_data_dir() -> Path | None:
+    try:
+        if sys.platform == "darwin":
+            pointer = (Path.home() / "Library" / "Application Support"
+                       / "3DFM.location")
+        else:
+            pointer = Path.home() / ".config" / "3DFM" / "data_dir.txt"
+        if not pointer.is_file():
+            return None
+        raw = pointer.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        first = raw.splitlines()[0].strip()
+        return Path(first).expanduser() if first else None
+    except Exception:
+        return None
+
+
 def data_dir() -> Path:
     o = os.environ.get("FM3D_DATA_DIR")
-    return Path(o).expanduser() if o else \
-        Path.home() / "Library" / "Application Support" / "3DFM"
+    if o and o.strip():
+        return Path(o.strip()).expanduser()
+    for reader in (_read_plist_data_dir, _read_pointer_data_dir):
+        try:
+            candidate = reader()
+        except Exception:
+            candidate = None
+        if candidate is not None and str(candidate).strip():
+            return candidate
+    return Path.home() / "Library" / "Application Support" / "3DFM"
 
 
 def token() -> str:
@@ -325,7 +368,269 @@ def cmd_settings(a: API, args):
         print(json.dumps(a.req("PUT", "/settings", {k: v}),
                          indent=2, ensure_ascii=False))
     else:
-        sys.exit("usage: 3dfm settings [get|set <key> <json-value>]")
+        sys.exit("usage: 3dfm settings [get|set <key> <json-value>] "
+                 "(keys include output_dir, models_dir (\"\"=default), port, ...)")
+
+
+def cmd_storage(a: API, args):
+    """Storage locations (GUI Settings > Storage parity).
+
+    usage:
+      3dfm storage status
+      3dfm storage move-models <absolute-path> [--no-move]
+        (default: move files; --no-move = pointer-only switch)
+      3dfm storage reset-models [--no-move]
+        (revert to <data_dir>/models)
+      3dfm storage validate-data-dir <absolute-path>
+        (pre-check only; data-dir moves are offline, see set-data-dir)
+      3dfm storage set-data-dir <absolute-path> [--move]
+        (offline: requires server stopped; --move copies existing data)
+      3dfm storage reset-data-dir
+        (offline: revert to default location)
+    """
+    import argparse
+    # Offline data-dir operations must not require the server (API=None).
+    if args and args[0] in ("set-data-dir", "reset-data-dir"):
+        _cmd_storage_data_offline(args)
+        return
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(cmd_storage.__doc__)
+        return
+    if a is None:
+        sys.exit("server not running (storage status/move needs the server; "
+                 "set-data-dir works offline)")
+    if not args or args[0] == "status":
+        print(json.dumps(a.req("GET", "/storage"),
+                         indent=2, ensure_ascii=False))
+        return
+    if args[0] == "validate-data-dir":
+        if len(args) != 2:
+            sys.exit("usage: 3dfm storage validate-data-dir <absolute-path>")
+        print(json.dumps(a.req("POST", "/storage/data/validate",
+                               {"path": args[1]}),
+                         indent=2, ensure_ascii=False))
+        return
+    if args[0] in ("move-models", "reset-models"):
+        p = argparse.ArgumentParser(prog=f"3dfm storage {args[0]}")
+        p.add_argument("path", nargs="?", default="")
+        p.add_argument("--no-move", action="store_true",
+                       help="pointer-only switch (no file move)")
+        ns = p.parse_args(args[1:])
+        path = "" if args[0] == "reset-models" else ns.path
+        if args[0] == "move-models" and not path:
+            sys.exit("usage: 3dfm storage move-models <absolute-path> [--no-move]")
+        print(json.dumps(a.req("POST", "/storage/models/move",
+                               {"path": path,
+                                "move_files": not ns.no_move}),
+                         indent=2, ensure_ascii=False))
+        return
+    sys.exit("usage: 3dfm storage "
+             "{status|move-models|reset-models|validate-data-dir|"
+             "set-data-dir|reset-data-dir}")
+
+
+def _write_data_dir_pointer(target: Path) -> None:
+    """Persist custom data dir (pointer file + UserDefaults plist)."""
+    import plistlib
+    import tempfile
+    if sys.platform == "darwin":
+        pointer = (Path.home() / "Library" / "Application Support"
+                   / "3DFM.location")
+    else:
+        pointer = Path.home() / ".config" / "3DFM" / "data_dir.txt"
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(pointer.parent),
+                               prefix=".3DFM-location-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(target) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(pointer))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if sys.platform == "darwin":
+        try:
+            plist = (Path.home() / "Library" / "Preferences"
+                     / "local.3dfm.app.plist")
+            data: dict = {}
+            if plist.is_file():
+                try:
+                    with open(plist, "rb") as f:
+                        loaded = plistlib.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+                except Exception:
+                    data = {}
+            data["customDataDir"] = str(target)
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            fd2, tmp2 = tempfile.mkstemp(dir=str(plist.parent),
+                                         prefix=".local-3dfm-")
+            try:
+                with os.fdopen(fd2, "wb") as f:
+                    plistlib.dump(data, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp2, str(plist))
+            except BaseException:
+                try:
+                    os.unlink(tmp2)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+
+def _clear_data_dir_pointer() -> None:
+    import plistlib
+    import tempfile
+    if sys.platform == "darwin":
+        pointer = (Path.home() / "Library" / "Application Support"
+                   / "3DFM.location")
+    else:
+        pointer = Path.home() / ".config" / "3DFM" / "data_dir.txt"
+    try:
+        pointer.unlink()
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            plist = (Path.home() / "Library" / "Preferences"
+                     / "local.3dfm.app.plist")
+            if plist.is_file():
+                with open(plist, "rb") as f:
+                    data = plistlib.load(f)
+                if isinstance(data, dict) and "customDataDir" in data:
+                    data.pop("customDataDir", None)
+                    fd, tmp = tempfile.mkstemp(dir=str(plist.parent),
+                                               prefix=".local-3dfm-")
+                    with os.fdopen(fd, "wb") as f:
+                        plistlib.dump(data, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, str(plist))
+        except Exception:
+            pass
+
+
+def _server_seems_live(root: Path) -> bool:
+    try:
+        pid = int((root / "server.pid").read_text(encoding="utf-8").strip())
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _cmd_storage_data_offline(args) -> None:
+    """Offline data-dir switch (server must be stopped)."""
+    import shutil
+    verb = args[0]
+    current = data_dir()
+    default = Path.home() / "Library" / "Application Support" / "3DFM"
+    if verb == "reset-data-dir":
+        if _server_seems_live(current):
+            sys.exit("server is running (run `3dfm stop` first) / "
+                     "サーバーが起動中です（先に `3dfm stop`）")
+        _clear_data_dir_pointer()
+        print(json.dumps({"ok": True, "data_dir": str(default),
+                          "mode": "reverted-to-default"},
+                         indent=2, ensure_ascii=False))
+        return
+    # set-data-dir
+    if len(args) < 2 or not args[1].strip():
+        sys.exit("usage: 3dfm storage set-data-dir <absolute-path> [--move]")
+    raw = args[1].strip()
+    do_move = "--move" in args[2:]
+    if "\x00" in raw or len(raw) > 1024:
+        sys.exit("invalid path")
+    new_root = Path(raw).expanduser()
+    if not new_root.is_absolute():
+        sys.exit("data_dir must be an absolute path / 絶対パスで指定してください")
+    if ".." in new_root.parts:
+        sys.exit("data_dir must not contain '..'")
+    if str(new_root) in ("/", "/System", "/Library", "/Applications",
+                         "/bin", "/sbin", "/usr", "/etc", "/var", "/private"):
+        sys.exit("system folder cannot be used")
+    try:
+        _parts = new_root.parts
+        if len(_parts) >= 3 and _parts[0] == "/" and _parts[1] == "Volumes":
+            _vol = os.path.join("/", "Volumes", _parts[2])
+            if not os.path.ismount(_vol):
+                sys.exit(f"external volume not mounted: {_vol} "
+                         "(connect the drive first) / "
+                         f"外付けボリュームがマウントされていません: {_vol}")
+    except Exception:
+        pass
+    if new_root == current:
+        sys.exit("already this folder (no change)")
+    if _server_seems_live(current):
+        sys.exit("server is running (run `3dfm stop` first) / "
+                 "サーバーが起動中です（先に `3dfm stop`）")
+    # Basic writability probe (create + delete test file).
+    try:
+        new_root.mkdir(parents=True, exist_ok=True)
+        probe = new_root / ".3dfm-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        sys.exit(f"folder is not writable: {e}")
+    if do_move and current.is_dir():
+        # Move entries (streaming, never RAM-loads weights).
+        try:
+            entries = list(current.iterdir())
+        except OSError as e:
+            sys.exit(f"cannot list current data dir: {e}")
+        # Refuse merging into non-empty destination.
+        try:
+            dst_entries = list(new_root.iterdir())
+            # Ignore our own probe leftovers (already removed).
+            dst_entries = [p for p in dst_entries
+                           if p.name != ".3dfm-write-test"]
+        except OSError as e:
+            sys.exit(f"cannot list destination: {e}")
+        names = {p.name for p in dst_entries}
+        for entry in entries:
+            if entry.name in names:
+                sys.exit(f"destination already has '{entry.name}' "
+                         "(refusing to merge) / "
+                         f"移動先に '{entry.name}' が既にあります")
+        for entry in sorted(entries, key=lambda p: p.name):
+            target = new_root / entry.name
+            try:
+                # Same-volume rename when possible (atomic, fast).
+                os.rename(str(entry), str(target))
+            except OSError:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.copytree(str(entry), str(target),
+                                    symlinks=True,
+                                    copy_function=shutil.copy2)
+                    shutil.rmtree(str(entry))
+                elif entry.is_symlink():
+                    linkto = os.readlink(str(entry))
+                    os.symlink(linkto, str(target))
+                    entry.unlink()
+                else:
+                    shutil.copy2(str(entry), str(target))
+                    entry.unlink()
+        print(json.dumps({"ok": True, "data_dir": str(new_root),
+                          "mode": "moved-offline",
+                          "moved_items": len(entries)},
+                         indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps({"ok": True, "data_dir": str(new_root),
+                          "mode": "pointer-only (run Setup to install)"},
+                         indent=2, ensure_ascii=False))
+    try:
+        _write_data_dir_pointer(new_root)
+    except OSError as e:
+        sys.exit(f"moved but cannot save pointer: {e}")
 
 
 def cmd_serve(_a, args):
@@ -380,14 +685,27 @@ COMMANDS = {"status": cmd_status, "submit": cmd_submit, "list": cmd_list,
             "retry": cmd_retry, "reorder": cmd_reorder, "log": cmd_log,
             "artifacts": cmd_artifacts, "file": cmd_file,
             "open": cmd_open, "models": cmd_models,
-            "settings": cmd_settings, "serve": cmd_serve, "stop": cmd_stop}
+            "settings": cmd_settings, "storage": cmd_storage,
+            "serve": cmd_serve, "stop": cmd_stop}
 
 
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         sys.exit("usage: 3dfm {" + "|".join(COMMANDS) + "}")
     cmd = COMMANDS[sys.argv[1]]
-    api = None if sys.argv[1] in ("serve", "stop") else API()
+    # Offline storage ops (set-data-dir/reset-data-dir/help) must work
+    # without the server; everything else under storage needs it.
+    needs_server = True
+    if sys.argv[1] in ("serve", "stop"):
+        needs_server = False
+    if sys.argv[1] == "storage" and len(sys.argv) > 2 and sys.argv[2] in (
+            "set-data-dir", "reset-data-dir", "-h", "--help", "help"):
+        needs_server = False
+    if sys.argv[1] == "storage" and len(sys.argv) == 2:
+        # `3dfm storage` alone prints help offline (no server needed).
+        print(cmd_storage.__doc__)
+        return
+    api = None if not needs_server else API()
     cmd(api, sys.argv[2:])
 
 
