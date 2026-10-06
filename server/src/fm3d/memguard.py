@@ -50,6 +50,31 @@ def rss_of_pid(pid: int) -> int:
         return -1
 
 
+def cmdline_of_pid(pid: int) -> str:
+    """Full command line of a pid, "" if the process is gone."""
+    out = _run(["ps", "-o", "command=", "-p", str(pid)])
+    return out.strip()
+
+
+def is_our_worker(pid: int, job_id: str) -> bool:
+    """True only if pid is still the worker we spawned for job_id.
+
+    `os.kill(pid, 0)` alone is not enough: PIDs are recycled, so a dead
+    worker's PID may later belong to an unrelated process. The manager
+    and crash recovery must never SIGKILL (or adopt) a stranger, so we
+    additionally require the command line to contain our worker module
+    marker and the exact job id.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not job_id:
+        return False
+    cmd = cmdline_of_pid(pid)
+    return bool(cmd) and "fm3d.worker" in cmd and str(job_id) in cmd
+
+
 def total_bytes() -> int:
     out = _run(["sysctl", "-n", "hw.memsize"])
     try:
@@ -71,12 +96,6 @@ def release_idle() -> dict:
         import gc as _gc
         before = free_bytes()
         _gc.collect()
-        # Allocator hint: try to return arenas on glibc-style builds.
-        # On macOS this is a no-op but harmless to attempt.
-        try:
-            import ctypes as _ct  # noqa: F401
-        except ImportError:
-            pass
         after = free_bytes()
         return {"before": before, "after": after}
     except Exception:

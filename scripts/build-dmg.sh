@@ -1,12 +1,13 @@
 #!/bin/bash
-# Build the ad-hoc DMG: dist/3DFM-0.1.0-adHoc.dmg
+# Build the ad-hoc DMG: dist/3DFM-<version>-adHoc.dmg
 # Ad-hoc signed (codesign -s -): Gatekeeper will block double-click open;
 # users right-click -> Open once. That is the agreed deliverable.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 STAGE="$DIST/dmg-stage"
-DMG="$DIST/3DFM-0.1.0-adHoc.dmg"
+VER="$(python3 -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('$ROOT/server/src/fm3d/__init__.py').read()).group(1))")"
+DMG="$DIST/3DFM-$VER-adHoc.dmg"
 
 bash "$ROOT/scripts/build-app.sh" || exit 1
 
@@ -14,8 +15,8 @@ echo "[dmg] staging..."
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp -R "$DIST/3DFM.app" "$STAGE/"
-cat > "$STAGE/README-adHoc.txt" <<'EOF'
-3DFM 0.1.0 (ad-hoc build)
+cat > "$STAGE/README-adHoc.txt" <<EOF
+3DFM $VER (ad-hoc build)
 =========================
 ad-hoc署名のため、初回は右クリック ->「開く」で起動してください。
 

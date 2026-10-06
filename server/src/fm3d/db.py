@@ -11,11 +11,12 @@ Safety properties:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -60,11 +61,27 @@ def _now() -> float:
 class JobStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        con = connect(db_path)
-        con.close()
+        with self._con():
+            pass
 
-    def _con(self) -> sqlite3.Connection:
-        return connect(self.db_path)
+    @contextlib.contextmanager
+    def _con(self) -> Iterator[sqlite3.Connection]:
+        """Per-call connection, always closed (no reliance on GC timing).
+
+        Each mutation is a single short transaction (`isolation_level=None`
+        autocommit + `with con:` commit scope); the context manager closes
+        the handle so WAL readers and page caches never accumulate in a
+        long-lived server process.
+        """
+        con = connect(self.db_path)
+        try:
+            with con:
+                yield con
+        finally:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
 
     # -- writes ---------------------------------------------------------
     def insert(self, job_id: str, name: str, mode: str, spec: dict,
@@ -101,10 +118,34 @@ class JobStore:
                 (stage, progress, eta_s, job_id))
 
     def reorder(self, ordered_ids: list[str]) -> None:
+        """Apply a queue order robustly.
+
+        The ids given first keep their relative order at the front; any
+        other queued job not mentioned is appended behind (preserving its
+        old relative order) instead of being stranded on a stale index.
+        Unknown or finished ids are still stamped but never disturb the
+        remaining queue.
+        """
         with self._con() as con:
-            for i, jid in enumerate(ordered_ids):
+            con.execute("BEGIN")
+            pos = 0
+            seen: set[str] = set()
+            for jid in ordered_ids:
+                if jid in seen:
+                    continue
+                seen.add(jid)
                 con.execute("UPDATE jobs SET queue_index=? WHERE id=?",
-                            (i, jid))
+                            (pos, jid))
+                pos += 1
+            rows = con.execute(
+                "SELECT id FROM jobs WHERE state='queued' "
+                "ORDER BY queue_index, created_at").fetchall()
+            for r in rows:
+                if r["id"] in seen:
+                    continue
+                con.execute("UPDATE jobs SET queue_index=? WHERE id=?",
+                            (pos, r["id"]))
+                pos += 1
 
     def delete(self, job_id: str) -> int:
         with self._con() as con:
@@ -148,23 +189,21 @@ class JobStore:
         """Mark jobs stuck in `running` from a previous (dead) server run.
 
         Returns the ids that were failed. A job is only kept as running if
-        its recorded worker_pid is still alive; otherwise it is failed with
-        error=worker-gone. Called once at server startup.
+        its recorded worker_pid is still alive *and* the process is really
+        our worker for that job (command-line check via a pid marker: PIDs
+        get recycled, so signal-0 alone could match a stranger and leave
+        the job stuck — or worse, let the watchdog kill someone else's
+        process). Otherwise it is failed with error=worker-gone. Called
+        once at server startup.
         """
-        import os
+        from . import memguard
         fixed: list[str] = []
         with self._con() as con:
             rows = con.execute(
                 "SELECT id, worker_pid FROM jobs WHERE state='running'").fetchall()
             for r in rows:
-                pid = r["worker_pid"]
-                alive = False
-                if pid:
-                    try:
-                        os.kill(int(pid), 0)
-                        alive = True
-                    except (OSError, ValueError):
-                        alive = False
+                alive = memguard.is_our_worker(r["worker_pid"] or 0,
+                                               r["id"])
                 if not alive:
                     con.execute(
                         "UPDATE jobs SET state='failed', finished_at=?, "

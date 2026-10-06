@@ -260,18 +260,37 @@ class _Heartbeat:
     The server's stall watchdog kills workers with no output; diffusion
     sampling on MPS can run minutes per stage with zero Python-level
     callbacks, so a thread re-emits the current stage percentage.
+
+    The refresh stops after `max_s` seconds (env FM3D_HEARTBEAT_MAX_S,
+    default 1500): without a cap, a truly hung native call would refresh
+    forever and the stall watchdog — the only hang detector — could never
+    fire, leaving the worker (and its gigabytes) alive indefinitely. The
+    manager derives the cap from `stall_timeout_s` so the watchdog always
+    gets the last word.
     """
 
-    def __init__(self, ctx: Ctx, stage: str, pct: float, msg: str):
+    def __init__(self, ctx: Ctx, stage: str, pct: float, msg: str,
+                 max_s: float | None = None, interval_s: float = 20.0):
         import threading
+        import time as _t
+        if max_s is None:
+            try:
+                max_s = float(os.environ.get("FM3D_HEARTBEAT_MAX_S",
+                                             "1500") or 1500)
+            except (TypeError, ValueError):
+                max_s = 1500.0
         self._ctx = ctx
         self._args = (stage, pct, msg)
+        self._interval = max(0.01, float(interval_s))
+        self._deadline = _t.monotonic() + max(60.0, max_s)
         self._stop = threading.Event()
         self._th = threading.Thread(target=self._loop, daemon=True)
 
     def _loop(self):
         import time as _t
-        while not self._stop.wait(20.0):
+        while not self._stop.wait(self._interval):
+            if _t.monotonic() > self._deadline:
+                break
             try:
                 self._ctx.progress(*self._args)
             except Exception:

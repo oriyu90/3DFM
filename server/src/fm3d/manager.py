@@ -39,6 +39,19 @@ MIN_FREE_GB_BY_MODE = {"normal": 12.0, "human": 20.0, "test": 0.5}
 WORKER_MODULE = "fm3d.worker"
 
 
+def heartbeat_max_s(settings: dict) -> float:
+    """Cap for the worker's progress heartbeat (see backends._Heartbeat).
+
+    Derived from `stall_timeout_s` minus a grace margin so the stall
+    watchdog always gets the last word on hung native calls.
+    """
+    try:
+        stall = float(settings.get("stall_timeout_s", 1800) or 1800)
+    except (TypeError, ValueError):
+        stall = 1800.0
+    return max(600.0, stall - 300.0)
+
+
 class AdoptedProc:
     """Minimal process handle for a worker that outlived a server restart."""
 
@@ -133,22 +146,73 @@ class JobManager:
         self._idle_ticks = 0
 
     # -- public API used by REST --------------------------------------
-    def create_job(self, name: str, mode: str, spec: dict,
-                   inputs: list[tuple[str, bytes]],
-                   seed: Optional[int]) -> str:
+    def _stage_files(self, files: list[tuple[str, bytes | Path]]
+                     ) -> tuple[Path, list[tuple[str, Path]]]:
+        """Land upload bytes (or pre-staged paths) in a staging dir.
+
+        Returns (stage_dir, [(safe_name, staged_path)]). The caller moves
+        them into the final inputs dir via _commit_new_job, then removes
+        the (now empty) stage dir — or drops it on error. Staging lives
+        inside jobs_dir so the final move is an atomic same-volume rename.
+        """
+        stage = self.dirs.jobs_dir / f".stage-{_new_id()}"
+        stage.mkdir(parents=True, exist_ok=True)
+        staged: list[tuple[str, Path]] = []
+        try:
+            for fname, payload in files:
+                safe = Path(fname).name or "input"
+                if not safe or safe in (".", ".."):
+                    safe = "input"
+                dest = stage / safe
+                if isinstance(payload, (bytes, bytearray)):
+                    _atomic_write(dest, bytes(payload))
+                else:
+                    # Already on disk (streamed upload / retry copy):
+                    # same-volume atomic move, no RAM involved.
+                    os.replace(str(payload), str(dest))
+                staged.append((safe, dest))
+            return stage, staged
+        except BaseException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+    def _commit_new_job(self, name: str, mode: str, spec: dict,
+                        seed: Optional[int],
+                        staged: list[tuple[str, Path]]) -> str:
         job_id = _new_id()
         jdir = self.dirs.job_dir(job_id)
-        (jdir / "inputs").mkdir(parents=True, exist_ok=True)
-        for fname, blob in inputs:
-            safe = Path(fname).name or "input"
-            _atomic_write(jdir / "inputs" / safe, blob)
+        idir = jdir / "inputs"
+        idir.mkdir(parents=True, exist_ok=True)
+        for safe, src in staged:
+            os.replace(str(src), str(idir / safe))
         record = {"id": job_id, "name": name, "mode": mode,
                   "spec": spec, "seed": seed,
-                  "inputs": sorted(p.name for p in (jdir / "inputs").iterdir())}
+                  "inputs": sorted(p.name for p in idir.iterdir())}
         _atomic_write(jdir / "spec.json",
                       json.dumps(record, ensure_ascii=False).encode())
         self.store.insert(job_id, name, mode, spec, seed)
         return job_id
+
+    def create_job(self, name: str, mode: str, spec: dict,
+                   inputs: list[tuple[str, bytes]],
+                   seed: Optional[int]) -> str:
+        stage, staged = self._stage_files(inputs)
+        try:
+            return self._commit_new_job(name, mode, spec, seed, staged)
+        finally:
+            # Commit moves every staged file out; whatever remains (empty
+            # dir on success, leftovers on failure) is dropped here.
+            shutil.rmtree(stage, ignore_errors=True)
+
+    def create_job_streamed(self, name: str, mode: str, spec: dict,
+                            seed: Optional[int],
+                            staged: list[tuple[str, Path]],
+                            stage: Path) -> str:
+        """Commit files the endpoint already streamed to a staging dir."""
+        try:
+            return self._commit_new_job(name, mode, spec, seed, staged)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def cancel_job(self, job_id: str, force: bool = False) -> tuple[bool, str]:
         job = self.store.get(job_id)
@@ -188,13 +252,29 @@ class JobManager:
             spec_rec = json.loads((src / "spec.json").read_text())
         except (OSError, ValueError):
             return None, "original spec unreadable"
-        blobs = []
-        for p in sorted((src / "inputs").glob("*")):
-            if p.is_file():
-                blobs.append((p.name, p.read_bytes()))
-        return self.create_job(job["name"], job["mode"],
-                               spec_rec.get("spec", {}), blobs,
-                               job["seed"]), "queued"
+        if not (src / "inputs").is_dir():
+            return None, "original inputs missing"
+        # Copy (not read) the original inputs through a staging dir: retry
+        # of a 6-view human job must not load hundreds of MB into the
+        # long-lived server process. An empty inputs dir is legitimate
+        # (e.g. test backend needs no image) — only a missing dir is an
+        # error.
+        stage = self.dirs.jobs_dir / f".stage-{_new_id()}"
+        try:
+            stage.mkdir(parents=True, exist_ok=True)
+            staged: list[tuple[str, Path]] = []
+            for p in sorted((src / "inputs").glob("*")):
+                if p.is_file() and p.name not in (".", ".."):
+                    dest = stage / Path(p.name).name
+                    shutil.copyfile(p, dest)
+                    staged.append((dest.name, dest))
+            return self._commit_new_job(
+                job["name"], job["mode"], spec_rec.get("spec", {}),
+                job["seed"], staged), "queued"
+        except OSError as e:
+            return None, f"cannot stage retry inputs: {e}"
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
     def reorder(self, ordered_ids: list[str]) -> None:
         self.store.reorder(ordered_ids)
@@ -334,6 +414,10 @@ class JobManager:
         env.setdefault("ATTN_BACKEND", "sdpa")
         env.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
         env.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+        # Bound the worker's progress heartbeat so a hung native call
+        # stops refreshing and the stall watchdog below can fire (see
+        # backends._Heartbeat). Cap = stall window minus a grace margin.
+        env["FM3D_HEARTBEAT_MAX_S"] = str(heartbeat_max_s(settings))
         try:
             proc = await asyncio.create_subprocess_exec(
                 exe, "-m", WORKER_MODULE, jid,
@@ -355,16 +439,15 @@ class JobManager:
     async def _supervise(self, jid: str) -> None:
         proc = self._procs.get(jid)
         if proc is None:
-            # Adopted after restart, or record/procs out of sync.
+            # Adopted after restart, or record/procs out of sync. Only
+            # adopt when the PID really is our worker for this job —
+            # PIDs are recycled, and adopting (then possibly SIGKILLing)
+            # a stranger would be catastrophic.
             job = self.store.get(jid)
-            pid = (job or {}).get("worker_pid")
-            if pid:
-                try:
-                    os.kill(int(pid), 0)
-                    self._procs[jid] = AdoptedProc(int(pid))
-                    return
-                except OSError:
-                    pass
+            pid = (job or {}).get("worker_pid") or 0
+            if memguard.is_our_worker(pid, jid):
+                self._procs[jid] = AdoptedProc(int(pid))
+                return
             self._finalize(jid, failed=True,
                            error="worker-gone (no process handle)")
             return

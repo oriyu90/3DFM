@@ -5,6 +5,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/3DFM.app"
+VER="$(python3 -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('$ROOT/server/src/fm3d/__init__.py').read()).group(1))")"
 
 echo "[build] swift build -c release..."
 swift build --package-path "$ROOT/app" -c release || exit 1
@@ -16,6 +17,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/ThreeDFM"
 cp "$ROOT/scripts/Info.plist" "$APP/Contents/Info.plist"
+# Stamp the release version so the bundle never reports a stale one.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" \
+  "$APP/Contents/Info.plist" 2>/dev/null || \
+  python3 -c "import plistlib; p='$APP/Contents/Info.plist'; d=plistlib.load(open(p,'rb')); d['CFBundleShortVersionString']='$VER'; plistlib.dump(d, open(p,'wb'))"
 # Payload the app needs at runtime (server source, CLI, setup scripts)
 mkdir -p "$APP/Contents/Resources/server" "$APP/Contents/Resources/cli" \
          "$APP/Contents/Resources/scripts"

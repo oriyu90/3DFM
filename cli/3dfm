@@ -261,15 +261,30 @@ def cmd_file(a: API, args):
         url, headers={"Authorization": f"Bearer {token()}"}, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            data = resp.read()
+            out = Path(ns.out) if ns.out else Path(Path(ns.path).name)
+            # Stream to a temp sibling + atomic rename: artifacts can be
+            # hundreds of MB; never hold them fully in RAM.
+            tmp = out.parent / (out.name + f".part-{os.getpid()}")
+            try:
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                os.replace(tmp, out)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     except urllib.error.HTTPError as e:
         try:
             detail = json.loads(e.read()).get("detail", e.reason)
         except ValueError:
             detail = e.reason
         sys.exit(f"error {e.code}: {detail}")
-    out = Path(ns.out) if ns.out else Path(Path(ns.path).name)
-    out.write_bytes(data)
     print(str(out))
 
 
@@ -329,19 +344,50 @@ def cmd_serve(_a, args):
         os.execvpe(py, cmd, env)
 
 
+def cmd_stop(_a, _args):
+    """Stop the local server via its pid file (SIGTERM, then SIGKILL)."""
+    import signal
+    pid_file = data_dir() / "server.pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        sys.exit("no server pid file (server not running?)")
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        sys.exit(f"stale pid file removed (pid {pid} not running)")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):  # up to ~5s graceful shutdown
+        time.sleep(0.1)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            print("server stopped")
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    print("server killed (did not exit on SIGTERM)")
+
+
 COMMANDS = {"status": cmd_status, "submit": cmd_submit, "list": cmd_list,
             "show": cmd_show, "cancel": cmd_cancel, "delete": cmd_delete,
             "retry": cmd_retry, "reorder": cmd_reorder, "log": cmd_log,
             "artifacts": cmd_artifacts, "file": cmd_file,
             "open": cmd_open, "models": cmd_models,
-            "settings": cmd_settings, "serve": cmd_serve}
+            "settings": cmd_settings, "serve": cmd_serve, "stop": cmd_stop}
 
 
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         sys.exit("usage: 3dfm {" + "|".join(COMMANDS) + "}")
     cmd = COMMANDS[sys.argv[1]]
-    api = None if sys.argv[1] == "serve" else API()
+    api = None if sys.argv[1] in ("serve", "stop") else API()
     cmd(api, sys.argv[2:])
 
 

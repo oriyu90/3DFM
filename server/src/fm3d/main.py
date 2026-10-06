@@ -20,6 +20,7 @@ from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException,
 from fastapi.responses import FileResponse
 
 from . import memguard
+from . import __version__ as _server_version
 from .db import JobStore
 from .manager import JobManager
 from .paths import DataDirs, resolve_data_dir
@@ -30,6 +31,9 @@ from .settings import validate as validate_settings
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_FILES = 8
 MODES = ("normal", "human", "test")
+# Uploads are streamed in chunks so a batch of large images never sits
+# fully in the long-lived server process (see submit()).
+UPLOAD_CHUNK = 1024 * 1024
 
 
 def _read_token(path: Path) -> str:
@@ -67,6 +71,19 @@ async def lifespan(app: FastAPI):
     yield
     mgr.stop()
     await task
+    # Remove our liveness marker here (not only in main()'s finally):
+    # uvicorn re-kills itself with the received signal AFTER graceful
+    # shutdown, so code after uvicorn.run() never executes on SIGTERM.
+    _drop_pid_file(dirs)
+
+
+def _drop_pid_file(dirs: DataDirs) -> None:
+    try:
+        if dirs.pid_path.read_text(encoding="utf-8").strip() == str(
+                os.getpid()):
+            dirs.pid_path.unlink()
+    except OSError:
+        pass
 
 
 def _apply_retention(dirs: DataDirs, store: JobStore,
@@ -78,8 +95,14 @@ def _apply_retention(dirs: DataDirs, store: JobStore,
     for job in store.list(["done", "failed", "cancelled"]):
         fin = job.get("finished_at") or 0
         if fin and fin < cutoff:
-            shutil.rmtree(dirs.job_dir(job["id"]), ignore_errors=True)
-            store.delete(job["id"])
+            # Only forget the DB record when the files are actually gone:
+            # a half-failed rmtree must keep its record, never orphan
+            # gigabytes silently.
+            errors: list = []
+            shutil.rmtree(dirs.job_dir(job["id"]), ignore_errors=False,
+                          onerror=lambda *a: errors.append(a))
+            if not errors:
+                store.delete(job["id"])
 
 
 def create_app() -> FastAPI:
@@ -88,12 +111,14 @@ def create_app() -> FastAPI:
     settings = load_settings(dirs.settings_path)
     token = _read_token(dirs.token_path)
     store = JobStore(dirs.db_path)
-    app = FastAPI(title="3DFM", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="3DFM", version=_server_version,
+                  lifespan=lifespan)
     app.state.dirs = dirs
     app.state.settings = settings
     app.state.token = token
     app.state.store = store
     app.state.mgr = JobManager(dirs, store, lambda: app.state.settings)
+    app.state.gpu_probe = {"at": 0.0, "value": "unknown"}
 
     async def authed(authorization: Optional[str] = Header(None)):
         if not authorization or not authorization.startswith("Bearer "):
@@ -103,8 +128,8 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health():
-        gpu = "mps" if _has_mps() else "cpu"
-        return {"status": "ok", "version": "0.1.0", "gpu": gpu,
+        return {"status": "ok", "version": _server_version,
+                "gpu": _gpu_kind(app),
                 "mem_total_gb": round((memguard.total_bytes() or 0) / 1024**3, 1),
                 "mem_free_gb": round((memguard.free_bytes() or 0) / 1024**3, 1)}
 
@@ -126,19 +151,51 @@ def create_app() -> FastAPI:
             raise HTTPException(403, "test backend disabled")
         if len(images) > MAX_FILES:
             raise HTTPException(422, f"max {MAX_FILES} images")
-        blobs: list[tuple[str, bytes]] = []
-        total = 0
-        for up in images:
-            data = await up.read()
-            if len(data) > MAX_UPLOAD_BYTES:
-                raise HTTPException(422, f"{up.filename}: file too large")
-            if not data:
-                raise HTTPException(422, f"{up.filename}: empty file")
-            total += len(data)
-            if total > MAX_UPLOAD_BYTES * MAX_FILES:
-                raise HTTPException(422, "total upload too large")
-            blobs.append((Path(up.filename or "input").name, data))
-        n = len(blobs)
+        # Stream uploads straight to a staging dir in 1 MiB chunks: the
+        # server is long-lived, so multi-image batches must never sit
+        # fully in RAM (previous code awaited up.read() whole).
+        import secrets as _secrets
+        mgr: JobManager = app.state.mgr
+        stage = mgr.dirs.jobs_dir / f".stage-{_secrets.token_hex(8)}"
+        try:
+            stage.mkdir(parents=True, exist_ok=True)
+            staged: list[tuple[str, Path]] = []
+            total = 0
+            for up in images:
+                fname = Path(up.filename or "input").name or "input"
+                if fname in (".", ".."):
+                    fname = "input"
+                dest = stage / fname
+                # Same basename twice: keep both (inputs/ is name-sorted).
+                n = 1
+                while dest.exists():
+                    n += 1
+                    dest = stage / f"{dest.stem}-{n}{dest.suffix}"
+                size = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = await up.read(UPLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        total += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            raise HTTPException(
+                                422, f"{fname}: file too large")
+                        if total > MAX_UPLOAD_BYTES * MAX_FILES:
+                            raise HTTPException(
+                                422, "total upload too large")
+                        f.write(chunk)
+                if size == 0:
+                    raise HTTPException(422, f"{fname}: empty file")
+                staged.append((dest.name, dest))
+        except HTTPException:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        except OSError as e:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise HTTPException(500, f"cannot store upload: {e}")
+        n = len(staged)
         if mode == "normal" and n != 1:
             raise HTTPException(422, "normal mode needs exactly 1 image")
         if mode == "human" and n not in (1, 6):
@@ -151,9 +208,9 @@ def create_app() -> FastAPI:
             seed = None if seed is None else int(seed)
         except (TypeError, ValueError):
             raise HTTPException(422, "seed must be int")
-        mgr: JobManager = app.state.mgr
         try:
-            jid = mgr.create_job(name, mode, body, blobs, seed)
+            jid = mgr.create_job_streamed(name, mode, body, seed,
+                                          staged, stage)
         except OSError as e:
             raise HTTPException(500, f"cannot store job: {e}")
         return {"id": jid}
@@ -349,6 +406,40 @@ def _has_mps() -> bool:
         return False
 
 
+def _gpu_kind(app) -> str:
+    """Report the real accelerator ("mps"/"cpu"/"unknown").
+
+    The server process itself must stay torch-free (isolation
+    architecture), so MPS availability is probed inside the trellis venv
+    interpreter instead. The probe imports torch (seconds when cold), so
+    the result is cached for 10 minutes.
+    """
+    import subprocess as _sp
+    import sys as _sys
+    cache = app.state.gpu_probe
+    if time.time() - cache["at"] < 600 and cache["value"] != "unknown":
+        return cache["value"]
+    value = "unknown"
+    try:
+        exe = app.state.dirs.venvs_dir / "trellis" / "bin" / "python"
+        if exe.exists():
+            p = _sp.run(
+                [str(exe), "-c",
+                 "import torch;print(torch.backends.mps.is_available())"],
+                capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                value = "mps" if p.stdout.strip() == "True" else "cpu"
+    except (OSError, _sp.SubprocessError):
+        pass
+    # Fallback: Apple Silicon without a runtime yet is MPS-capable.
+    if value == "unknown" and _sys.platform == "darwin":
+        import platform as _pl
+        if _pl.machine() == "arm64":
+            value = "mps"
+    cache["at"], cache["value"] = time.time(), value
+    return value
+
+
 def _manifest() -> list[dict]:
     # expected_gb tracks the *slim* layout (fetch allow_patterns +
     # prune_models.py): fp32 safetensors only, no framework duplicates.
@@ -390,17 +481,30 @@ def main() -> None:
     import uvicorn
     app = create_app()
     port = int(app.state.settings.get("port", 44931))
-    for attempt in range(10):
-        try:
-            uvicorn.run(app, host="127.0.0.1", port=port + attempt,
-                        log_level="warning", access_log=False)
-            return
-        except OSError as e:
-            if "address" in str(e).lower() or "in use" in str(e).lower():
-                print(f"port {port+attempt} busy, trying next")
-                continue
-            raise
-    raise SystemExit("no free port found")
+    # Liveness marker for `3dfm stop` (and for detecting stale servers).
+    # Written before serving, removed on every exit path.
+    try:
+        app.state.dirs.pid_path.write_text(str(os.getpid()),
+                                           encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        for attempt in range(10):
+            try:
+                uvicorn.run(app, host="127.0.0.1", port=port + attempt,
+                            log_level="warning", access_log=False)
+                return
+            except OSError as e:
+                if "address" in str(e).lower() or "in use" in str(e).lower():
+                    print(f"port {port+attempt} busy, trying next")
+                    continue
+                raise
+        raise SystemExit("no free port found")
+    finally:
+        # Backup for non-signal exits; the lifespan hook above handles
+        # SIGTERM/SIGINT (uvicorn re-raises the signal after graceful
+        # shutdown, so this line is skipped on signal death).
+        _drop_pid_file(app.state.dirs)
 
 
 if __name__ == "__main__":

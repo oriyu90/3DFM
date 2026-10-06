@@ -35,6 +35,11 @@ class DataDirs:
         return self.root / "server.token"
 
     @property
+    def pid_path(self) -> Path:
+        """Liveness marker for `3dfm stop` (written at serve, removed at exit)."""
+        return self.root / "server.pid"
+
+    @property
     def settings_path(self) -> Path:
         return self.root / "settings.json"
 
