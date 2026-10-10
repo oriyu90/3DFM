@@ -35,6 +35,123 @@ MODES = ("normal", "human", "test")
 # fully in the long-lived server process (see submit()).
 UPLOAD_CHUNK = 1024 * 1024
 
+# 32GB+ memory gates for heavy options (see _validate_job_spec).
+# Values in bytes; total unknown (-1) means fail-open (allow).
+_MIN_32GB = 32 * 1024**3
+_MIN_48GB = 48 * 1024**3
+_TEXTURE_CHOICES = (1024, 2048, 4096)
+_PIPELINE_CHOICES = ("512", "512->1024", "512->1536")
+
+
+def _bi(en: str, ja: str) -> str:
+    return f"{en} / {ja}"
+
+
+def _validate_job_spec(body: dict) -> tuple[bool, str]:
+    """Validate per-job spec before accepting (memory safety, 32GB+).
+
+    Returns (ok, bilingual_message). Unknown total memory fails open.
+    Heavy combos are rejected with 422 (not SIGKILL later) so a 32GB
+    Mac never OOMs from a single tap in GUI/CLI.
+    """
+    try:
+        total = memguard.total_bytes()
+    except Exception:
+        total = -1
+    # texture_size
+    if "texture_size" in body:
+        try:
+            tex = int(body["texture_size"])
+        except (TypeError, ValueError):
+            return False, _bi("texture_size must be 1024/2048/4096",
+                               "テクスチャは1024/2048/4096で指定してください")
+        if tex not in _TEXTURE_CHOICES:
+            return False, _bi(
+                "texture_size must be one of 1024/2048/4096",
+                "テクスチャは1024/2048/4096のいずれかで指定してください")
+        if total > 0 and total < _MIN_32GB and tex == 4096:
+            return False, _bi(
+                f"texture 4096 needs 32GB+ memory (this Mac: "
+                f"{total/1024**3:.0f}GB); use 2048 or lower",
+                f"テクスチャ4096は32GB以上のメモリが必要です"
+                f"（このMac: {total/1024**3:.0f}GB）。2048以下を使用してください")
+    # pipeline_type
+    if "pipeline_type" in body:
+        pt = str(body.get("pipeline_type", ""))
+        if pt not in _PIPELINE_CHOICES:
+            return False, _bi(
+                "pipeline_type must be 512, 512->1024 or 512->1536",
+                "パイプラインは512 / 512->1024 / 512->1536のいずれかで指定してください")
+        if total > 0 and total < _MIN_32GB and pt == "512->1536":
+            return False, _bi(
+                f"pipeline 512->1536 needs 32GB+ memory (this Mac: "
+                f"{total/1024**3:.0f}GB); use 512->1024 or lower",
+                f"パイプライン512->1536は32GB以上のメモリが必要です"
+                f"（このMac: {total/1024**3:.0f}GB）。512->1024以下を使用してください")
+    # Heavy combo on 32GB-class: 1536 + 4096 needs 48GB+.
+    try:
+        _tex = int(body.get("texture_size", 2048))
+        _pt = str(body.get("pipeline_type", "512->1024"))
+    except (TypeError, ValueError):
+        _tex, _pt = 2048, "512->1024"
+    if (total > 0 and total < _MIN_48GB and _tex == 4096
+            and _pt == "512->1536"):
+        return False, _bi(
+            "pipeline 512->1536 + texture 4096 needs 48GB+ memory; "
+            "lower one of them (e.g. 512->1024 + 2048)",
+            "パイプライン512->1536とテクスチャ4096の併用は48GB以上のメモリが"
+            "必要です。どちらかを下げてください（例: 512->1024 + 2048）")
+    # rembg_threshold
+    if "rembg_threshold" in body and body["rembg_threshold"] is not None:
+        try:
+            rt = float(body["rembg_threshold"])
+        except (TypeError, ValueError):
+            return False, _bi("rembg_threshold must be 0.0-1.0",
+                               "背景除去しきい値は0.0〜1.0で指定してください")
+        if not (0.0 <= rt <= 1.0):
+            return False, _bi("rembg_threshold must be 0.0-1.0",
+                               "背景除去しきい値は0.0〜1.0で指定してください")
+    # steps / mv_steps
+    for _k in ("steps", "mv_steps"):
+        if _k in body and body[_k] is not None:
+            try:
+                _v = int(body[_k])
+            except (TypeError, ValueError):
+                return False, _bi(f"{_k} must be a positive int",
+                                   f"{_k}は正の整数で指定してください")
+            if not (1 <= _v <= 200):
+                return False, _bi(f"{_k} must be 1-200",
+                                   f"{_k}は1〜200で指定してください")
+    # mv_resolution
+    if "mv_resolution" in body and body["mv_resolution"] is not None:
+        try:
+            _r = int(body["mv_resolution"])
+        except (TypeError, ValueError):
+            return False, _bi("mv_resolution must be 512 or 768",
+                               "MV解像度は512または768で指定してください")
+        if _r not in (512, 768):
+            # Allow 256-1024 range but gate 768 on memory below.
+            if not (256 <= _r <= 1024):
+                return False, _bi("mv_resolution must be 256-1024",
+                                   "MV解像度は256〜1024で指定してください")
+        if total > 0 and total < _MIN_48GB and _r == 768:
+            return False, _bi(
+                f"mv_resolution 768 needs 48GB+ memory (this Mac: "
+                f"{total/1024**3:.0f}GB); use 512",
+                f"MV解像度768は48GB以上のメモリが必要です"
+                f"（このMac: {total/1024**3:.0f}GB）。512を使用してください")
+    # decimation_target
+    if "decimation_target" in body and body["decimation_target"] is not None:
+        try:
+            _d = int(body["decimation_target"])
+        except (TypeError, ValueError):
+            return False, _bi("decimation_target must be a positive int",
+                               "decimation_targetは正の整数で指定してください")
+        if _d <= 0 or _d > 2000000:
+            return False, _bi("decimation_target must be 1-2000000",
+                               "decimation_targetは1〜2000000で指定してください")
+    return True, ""
+
 
 def _read_token(path: Path) -> str:
     try:
@@ -130,14 +247,18 @@ def create_app() -> FastAPI:
 
     async def authed(authorization: Optional[str] = Header(None)):
         if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(401, "missing bearer token")
+            raise HTTPException(
+                401, _bi("missing bearer token",
+                         "Bearerトークンがありません"))
         if not secrets.compare_digest(authorization[7:], app.state.token):
-            raise HTTPException(403, "bad token")
+            raise HTTPException(
+                403, _bi("bad token", "トークンが正しくありません"))
 
     @app.get("/health")
     def health():
         return {"status": "ok", "version": _server_version,
                 "gpu": _gpu_kind(app),
+                "port": _current_port(app),
                 "mem_total_gb": round((memguard.total_bytes() or 0) / 1024**3, 1),
                 "mem_free_gb": round((memguard.free_bytes() or 0) / 1024**3, 1)}
 
@@ -145,20 +266,35 @@ def create_app() -> FastAPI:
     async def submit(spec: str = Form(...),
                      images: list[UploadFile] = File(default=[])):
         if len(spec) > 64 * 1024:
-            raise HTTPException(422, "spec too large")
+            raise HTTPException(
+                422, _bi("spec too large (max 64KB)",
+                         "specが大きすぎます（最大64KB）"))
         try:
             body = json.loads(spec)
         except ValueError:
-            raise HTTPException(422, "spec must be JSON")
+            raise HTTPException(
+                422, _bi("spec must be JSON", "specはJSONで指定してください"))
         if not isinstance(body, dict):
-            raise HTTPException(422, "spec must be an object")
+            raise HTTPException(
+                422, _bi("spec must be an object",
+                         "specはオブジェクトで指定してください"))
         mode = body.get("mode", "normal")
         if mode not in MODES:
-            raise HTTPException(422, f"mode must be one of {MODES}")
+            raise HTTPException(
+                422, _bi(f"mode must be one of {MODES}",
+                         f"modeは{','.join(MODES)}のいずれかで指定してください"))
         if mode == "test" and os.environ.get("FM3D_TEST") != "1":
-            raise HTTPException(403, "test backend disabled")
+            raise HTTPException(
+                403, _bi("test backend disabled",
+                         "テストバックエンドは無効です"))
         if len(images) > MAX_FILES:
-            raise HTTPException(422, f"max {MAX_FILES} images")
+            raise HTTPException(
+                422, _bi(f"max {MAX_FILES} images",
+                         f"画像は最大{MAX_FILES}枚までです"))
+        # Memory-safe spec validation (32GB+ gates, bilingual).
+        _ok, _msg = _validate_job_spec(body)
+        if not _ok:
+            raise HTTPException(422, _msg)
         # Stream uploads straight to a staging dir in 1 MiB chunks: the
         # server is long-lived, so multi-image batches must never sit
         # fully in RAM (previous code awaited up.read() whole).
@@ -189,38 +325,54 @@ def create_app() -> FastAPI:
                         total += len(chunk)
                         if size > MAX_UPLOAD_BYTES:
                             raise HTTPException(
-                                422, f"{fname}: file too large")
+                                422, _bi(f"{fname}: file too large (max 200MB)",
+                                         f"{fname}: ファイルが大きすぎます（最大200MB）"))
                         if total > MAX_UPLOAD_BYTES * MAX_FILES:
                             raise HTTPException(
-                                422, "total upload too large")
+                                422, _bi("total upload too large",
+                                         "アップロード合計が大きすぎます"))
                         f.write(chunk)
                 if size == 0:
-                    raise HTTPException(422, f"{fname}: empty file")
+                    raise HTTPException(
+                        422, _bi(f"{fname}: empty file",
+                                 f"{fname}: 空ファイルです"))
                 staged.append((dest.name, dest))
         except HTTPException:
             shutil.rmtree(stage, ignore_errors=True)
             raise
         except OSError as e:
             shutil.rmtree(stage, ignore_errors=True)
-            raise HTTPException(500, f"cannot store upload: {e}")
+            raise HTTPException(
+                500, _bi(f"cannot store upload: {e}",
+                         f"アップロードを保存できません: {e}"))
         n = len(staged)
         if mode == "normal" and n != 1:
-            raise HTTPException(422, "normal mode needs exactly 1 image")
+            raise HTTPException(
+                422, _bi("normal mode needs exactly 1 image",
+                         "普通モードは画像1枚が必要です"))
         if mode == "human" and n not in (1, 6):
-            raise HTTPException(422, "human mode needs 1 or 6 images")
+            raise HTTPException(
+                422, _bi("human mode needs 1 or 6 images",
+                         "人物モードは1枚または6枚の画像が必要です"))
         if mode == "test" and n > MAX_FILES:
-            raise HTTPException(422, f"max {MAX_FILES} images")
+            raise HTTPException(
+                422, _bi(f"max {MAX_FILES} images",
+                         f"画像は最大{MAX_FILES}枚までです"))
         name = str(body.get("name") or "job")[:80]
         seed = body.get("seed")
         try:
             seed = None if seed is None else int(seed)
         except (TypeError, ValueError):
-            raise HTTPException(422, "seed must be int")
+            raise HTTPException(
+                422, _bi("seed must be int",
+                         "seedは整数で指定してください"))
         try:
             jid = mgr.create_job_streamed(name, mode, body, seed,
                                           staged, stage)
         except OSError as e:
-            raise HTTPException(500, f"cannot store job: {e}")
+            raise HTTPException(
+                500, _bi(f"cannot store job: {e}",
+                         f"ジョブを保存できません: {e}"))
         return {"id": jid}
 
     @app.get("/jobs", dependencies=[Depends(authed)])
@@ -263,14 +415,20 @@ def create_app() -> FastAPI:
     def reorder(body: dict):
         ids = body.get("ids", []) if isinstance(body, dict) else None
         if not isinstance(ids, list):
-            raise HTTPException(422, "ids must be a list")
+            raise HTTPException(
+                422, _bi("ids must be a list",
+                         "idsはリストで指定してください"))
         if len(ids) > 1000:
-            raise HTTPException(422, "too many ids")
+            raise HTTPException(
+                422, _bi("too many ids (max 1000)",
+                         "idsが多すぎます（最大1000）"))
         clean = []
         for i in ids:
             s = str(i)
             if len(s) > 128 or "/" in s or ".." in s:
-                raise HTTPException(422, f"invalid job id: {s[:32]}")
+                raise HTTPException(
+                    422, _bi(f"invalid job id: {s[:32]}",
+                             f"無効なジョブID: {s[:32]}"))
             clean.append(s)
         app.state.mgr.reorder(clean)
         return {"ok": True}
@@ -345,7 +503,9 @@ def create_app() -> FastAPI:
         if isinstance(body, dict) and body.get("tier"):
             tier = str(body["tier"])
         if tier not in ("normal", "human", "full", "none"):
-            raise HTTPException(422, "tier must be normal|human|full|none")
+            raise HTTPException(
+                422, _bi("tier must be normal|human|full|none",
+                         "tierはnormal/human/full/noneで指定してください"))
         # Locate fetch_models.py: bundled Resources/scripts or repo scripts.
         cands = [
             Path(__file__).resolve().parents[3] / "scripts" / "fetch_models.py",
@@ -364,9 +524,13 @@ def create_app() -> FastAPI:
         try:
             proc = _sp.run(cmd, capture_output=True, text=True, timeout=3600)
         except _sp.TimeoutExpired:
-            raise HTTPException(504, "model download timed out")
+            raise HTTPException(
+                504, _bi("model download timed out",
+                         "モデルダウンロードがタイムアウトしました"))
         except OSError as e:
-            raise HTTPException(500, f"cannot start fetch: {e}")
+            raise HTTPException(
+                500, _bi(f"cannot start fetch: {e}",
+                         f"ダウンロードを開始できません: {e}"))
         # Manifest is the machine-readable result.
         manifest_path = app.state.dirs.models_dir / "manifest.json"
         manifest = {}
@@ -389,6 +553,15 @@ def create_app() -> FastAPI:
         ok, msg = validate_settings(patch)
         if not ok:
             raise HTTPException(422, msg)
+        # Crash safety: switching the models pointer while jobs are
+        # queued/running would split weights mid-pipeline. Require idle
+        # like POST /storage/models/move (409 when busy).
+        if "models_dir" in patch:
+            from . import storage as _storage_gate
+            idle_ok, idle_msg = _storage_gate.check_queue_idle(
+                app.state.store)
+            if not idle_ok:
+                raise HTTPException(409, idle_msg)
         app.state.settings.update(patch)
         # When models_dir changes via plain settings (pointer-only, no
         # file move), refresh the resolved dirs so subsequent
@@ -416,12 +589,14 @@ def create_app() -> FastAPI:
                     os.environ["FM3D_MODELS_DIR"] = str(new_dirs.models_dir)
             except (OSError, RuntimeError) as e:
                 raise HTTPException(
-                    500, f"cannot prepare models folder: {e} / "
-                         f"モデルフォルダを準備できません: {e}")
+                    500, _bi(f"cannot prepare models folder: {e}",
+                             f"モデルフォルダを準備できません: {e}"))
         try:
             save_settings(app.state.dirs.settings_path, app.state.settings)
         except OSError as e:
-            raise HTTPException(500, f"cannot save settings: {e}")
+            raise HTTPException(
+                500, _bi(f"cannot save settings: {e}",
+                         f"設定を保存できません: {e}"))
         return app.state.settings
 
     @app.get("/storage", dependencies=[Depends(authed)])
@@ -541,7 +716,9 @@ def create_app() -> FastAPI:
                 save_settings(app.state.dirs.settings_path,
                               app.state.settings)
             except OSError as e:
-                raise HTTPException(500, f"cannot save settings: {e}")
+                raise HTTPException(
+                    500, _bi(f"cannot save settings: {e}",
+                             f"設定を保存できません: {e}"))
             return {"ok": True, "models_dir": str(new_dirs.models_dir),
                     "mode": "reverted-to-default"}
         assert normalized is not None
@@ -568,7 +745,9 @@ def create_app() -> FastAPI:
                 save_settings(app.state.dirs.settings_path,
                               app.state.settings)
             except OSError as e:
-                raise HTTPException(500, f"cannot save settings: {e}")
+                raise HTTPException(
+                    500, _bi(f"cannot save settings: {e}",
+                             f"設定を保存できません: {e}"))
             return {"ok": True, "models_dir": str(normalized),
                     "mode": "pointer-only"}
         # move_files=True: space pre-check, then move contents.
@@ -613,6 +792,14 @@ def create_app() -> FastAPI:
                 "mode": "moved"}
 
     return app
+
+
+def _current_port(app) -> int:
+    """Best-effort current port (for /health observability)."""
+    try:
+        return int(app.state.settings.get("port", 44931))
+    except (TypeError, ValueError):
+        return 44931
 
 
 def _public(job: dict) -> dict:
@@ -714,13 +901,25 @@ def main() -> None:
         pass
     try:
         for attempt in range(10):
+            actual = port + attempt
+            # Observability: record the actual port so GUI/CLI/logs can
+            # show which port won the +1 scan (previously invisible).
             try:
-                uvicorn.run(app, host="127.0.0.1", port=port + attempt,
+                (app.state.dirs.root / "server.port").write_text(
+                    str(actual), encoding="utf-8")
+            except OSError:
+                pass
+            try:
+                app.state.settings["port_actual"] = actual
+            except Exception:
+                pass
+            try:
+                uvicorn.run(app, host="127.0.0.1", port=actual,
                             log_level="warning", access_log=False)
                 return
             except OSError as e:
                 if "address" in str(e).lower() or "in use" in str(e).lower():
-                    print(f"port {port+attempt} busy, trying next")
+                    print(f"port {actual} busy, trying next")
                     continue
                 raise
         raise SystemExit("no free port found")

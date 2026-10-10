@@ -78,43 +78,43 @@ struct MenuExtraView: View {
 
     var body: some View {
         if backend.needsSetup {
-            Button("セットアップを開始…") {
+            Button("セットアップを開始… / Start setup…") {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "setup")
             }
-            Text("初回のみ: ランタイムとAIモデルを自動導入します")
+            Text("初回のみ: ランタイムとAIモデルを自動導入します / First run: runtimes and AI models are installed automatically")
         } else {
             Text(backend.statusLine)
             if let active = backend.activeJob {
-                Button("キャンセル: \(active.name)") {
+                Button("キャンセル: \(active.name) / Cancel") {
                     Task { await backend.cancel(id: active.id) }
                 }
             }
             if !backend.queuedJobs.isEmpty {
-                Menu("キュー (\(backend.queuedJobs.count))") {
+                Menu("キュー (\(backend.queuedJobs.count)) / Queue") {
                     ForEach(backend.queuedJobs.prefix(6)) { j in
                         Text("\(j.name) — \(Int(j.progress))%")
                     }
                 }
             }
             Divider()
-            Button("新規生成…") {
+            Button("新規生成… / New…") {
                 backend.showNewJob = true
                 openWindow(id: "jobs")
             }
             .keyboardShortcut("n", modifiers: .command)
-            Button("キューを開く") {
+            Button("キューを開く / Open queue") {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "jobs")
             }
-            Button("設定…") {
+            Button("設定… / Settings…") {
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
         }
         Divider()
-        Button("3DFMを終了") { NSApp.terminate(nil) }
+        Button("3DFMを終了 / Quit 3DFM") { NSApp.terminate(nil) }
             .keyboardShortcut("q", modifiers: .command)
     }
 }
@@ -142,49 +142,56 @@ struct NewJobView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("新規生成").font(.title2)
-            Picker("モード", selection: $mode) {
-                Text("普通 (1枚)").tag("normal")
-                Text("人物 (1枚 or 6枚)").tag("human")
+            Text("新規生成 / New job").font(.title2)
+            Picker("モード / Mode", selection: $mode) {
+                Text("普通 (1枚) / Normal").tag("normal")
+                Text("人物 (1枚 or 6枚) / Human").tag("human")
             }.pickerStyle(.segmented)
-            TextField("名前", text: $name)
+            TextField("名前 / Name", text: $name)
                 .textFieldStyle(.roundedBorder)
             HStack {
-                Text("画像 (\(files.count))").foregroundStyle(.secondary)
+                Text("画像 (\(files.count)) / Images").foregroundStyle(.secondary)
                 Spacer()
-                Button("選択…", action: pickFiles)
+                Button("選択… / Choose…", action: pickFiles)
             }
             ForEach(files, id: \.self) { f in
                 Text(f.lastPathComponent).font(.caption).lineLimit(1)
             }
             if mode == "human" && files.count == 1 {
-                Toggle("正面1枚から残り5視点を合成 (MV-Adapter)", isOn: $synthesize)
+                Toggle("正面1枚から残り5視点を合成 (MV-Adapter) / Synthesize 5 views from front (MV-Adapter)", isOn: $synthesize)
             }
-            DisclosureGroup("詳細設定 (CLIと同一)") {
-                TextField("seed (空=ランダム)", text: $seedText)
+            DisclosureGroup("詳細設定 (CLIと同一) / Details (same as CLI)") {
+                TextField("seed (空=ランダム) / seed (empty=random)", text: $seedText)
                     .textFieldStyle(.roundedBorder)
-                Picker("パイプライン", selection: $pipeline) {
-                    Text("512 (速い)").tag("512")
-                    Text("512→1024 (標準)").tag("512->1024")
-                    Text("512→1536 (最高・32GB+推奨)").tag("512->1536")
+                Picker("パイプライン / Pipeline", selection: $pipeline) {
+                    Text("512 (速い / fast)").tag("512")
+                    Text("512→1024 (標準 / standard)").tag("512->1024")
+                    Text("512→1536 (最高・32GB+推奨 / best, 32GB+)").tag("512->1536")
                 }
-                Picker("テクスチャ", selection: $texture) {
+                Picker("テクスチャ / Texture", selection: $texture) {
                     Text("1024").tag(1024)
                     Text("2048").tag(2048)
                     Text("4096").tag(4096)
                 }.pickerStyle(.segmented)
-                TextField("背景除去しきい値 (空=既定 0.5/人物0.4)", text: $rembgText)
+                if pipeline == "512->1536" && texture == 4096 {
+                    Text("512→1536 + 4096は48GB+推奨です。32GBでは512→1024 + 2048を推奨。 / 512->1536 + 4096 prefers 48GB+. On 32GB use 512->1024 + 2048.")
+                        .font(.caption).foregroundStyle(.orange)
+                } else if pipeline == "512->1536" {
+                    Text("512→1536は32GB+推奨です。 / 512->1536 prefers 32GB+.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                TextField("背景除去しきい値 (空=既定 0.5/人物0.4) / Denoise threshold (empty=default)", text: $rembgText)
                     .textFieldStyle(.roundedBorder)
-                TextField("decimation_target (空=既定)", text: $decimationText)
+                TextField("decimation_target (空=既定) / decimation (empty=default)", text: $decimationText)
                     .textFieldStyle(.roundedBorder)
-                TextField("拡散steps (空=既定)", text: $stepsText)
+                TextField("拡散steps (空=既定) / steps (empty=default)", text: $stepsText)
                     .textFieldStyle(.roundedBorder)
                 if mode == "human" {
-                    TextField("MVプロンプト (空=high quality)", text: $mvPrompt)
+                    TextField("MVプロンプト (空=high quality) / MV prompt", text: $mvPrompt)
                         .textFieldStyle(.roundedBorder)
-                    TextField("MV steps (空=50)", text: $mvStepsText)
+                    TextField("MV steps (空=50) / MV steps (empty=50)", text: $mvStepsText)
                         .textFieldStyle(.roundedBorder)
-                    TextField("MV解像度 (空=自動)", text: $mvResText)
+                    TextField("MV解像度 (空=自動512/768・768は48GB+) / MV resolution (empty=auto, 768 needs 48GB+)", text: $mvResText)
                         .textFieldStyle(.roundedBorder)
                 }
             }
@@ -194,8 +201,8 @@ struct NewJobView: View {
             Spacer()
             HStack {
                 Spacer()
-                Button("キャンセル") { dismiss() }
-                Button("キューに追加") { submit() }
+                Button("キャンセル / Cancel") { dismiss() }
+                Button("キューに追加 / Enqueue") { submit() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(busy || files.isEmpty)
             }
@@ -245,7 +252,7 @@ struct NewJobView: View {
                     files: files, extra: extra)
                 dismiss()
             } catch {
-                self.error = "投入に失敗: \(error.localizedDescription)"
+                self.error = "投入に失敗 / Submit failed: \(error.localizedDescription)"
                 busy = false
             }
         }

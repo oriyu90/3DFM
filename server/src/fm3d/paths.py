@@ -330,7 +330,7 @@ class DataDirs:
 
     def ensure(self) -> "DataDirs":
         for p in (self.root, self.models_dir, self.venvs_dir,
-                  self.jobs_dir, self.logs_dir):
+                  self.runtimes_dir, self.jobs_dir, self.logs_dir):
             p.mkdir(parents=True, exist_ok=True)
         return self
 

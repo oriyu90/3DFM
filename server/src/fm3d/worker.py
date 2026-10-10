@@ -103,6 +103,12 @@ def main() -> int:
         print("usage: python -m fm3d.worker <job_id>", file=sys.stderr)
         return 1
     job_id = sys.argv[1]
+    # Path safety: job_id becomes a directory name. Reject traversal so
+    # a manual `python -m fm3d.worker ../../x` can never escape jobs/.
+    if (not job_id or "/" in job_id or "\\" in job_id or ".." in job_id
+            or len(job_id) > 128 or job_id in (".", "..")):
+        print(f"invalid job_id: {job_id[:32]}", file=sys.stderr)
+        return 1
     dirs = resolve_data_dir()
     jdir = dirs / "jobs" / job_id
     log = open(jdir / "log.txt", "a", encoding="utf-8", buffering=1)

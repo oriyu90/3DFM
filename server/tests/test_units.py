@@ -225,12 +225,22 @@ class TailTest(unittest.TestCase):
 
 class SettingsTest(unittest.TestCase):
     def test_reject_unknown_and_bad_types(self):
-        ok, _ = validate({"nope": 1})
+        ok, msg = validate({"nope": 1})
         self.assertFalse(ok)
-        ok, _ = validate({"mem_cap_gb": -1})
+        self.assertIn("/", msg)  # bilingual
+        ok, msg = validate({"mem_cap_gb": -1})
         self.assertFalse(ok)
+        self.assertIn("/", msg)
         ok, _ = validate({"stall_timeout_s": 5})
         self.assertTrue(ok)
+
+    def test_settings_validate_bilingual(self):
+        for patch in ({"port": 80}, {"texture_default": 9999},
+                      {"pipeline_default": "bad"},
+                      {"output_dir": ""}):
+            ok, msg = validate(patch)
+            self.assertFalse(ok)
+            self.assertIn("/", msg)
 
     def test_models_dir_empty_is_default(self):
         ok, _ = validate({"models_dir": ""})
@@ -330,6 +340,70 @@ class StorageTest(unittest.TestCase):
         d2 = DataDirs(tmp)
         self.assertTrue(str(d2.models_dir).endswith("/models"))
         self.assertTrue(str(d2.runtimes_dir).endswith("/runtimes"))
+
+    def test_data_dirs_ensure_creates_runtimes(self):
+        from fm3d.paths import DataDirs
+        tmp = Path(tempfile.mkdtemp(prefix="3dfm-ensure-"))
+        d = DataDirs(tmp / "data").ensure()
+        self.assertTrue((d.root / "runtimes").is_dir())
+        self.assertTrue((d.root / "venvs").is_dir())
+
+
+class SpecValidationTest(unittest.TestCase):
+    def test_rejects_bad_texture_and_pipeline(self):
+        from fm3d.main import _validate_job_spec
+        ok, msg = _validate_job_spec({"texture_size": 9999})
+        self.assertFalse(ok)
+        self.assertIn("/", msg)
+        ok, msg = _validate_job_spec({"pipeline_type": "bad"})
+        self.assertFalse(ok)
+        self.assertIn("/", msg)
+
+    def test_rejects_bad_ranges_bilingual(self):
+        from fm3d.main import _validate_job_spec
+        for spec in ({"rembg_threshold": 2.0}, {"steps": 0},
+                     {"mv_steps": 999}, {"mv_resolution": 10},
+                     {"decimation_target": -1}):
+            ok, msg = _validate_job_spec(spec)
+            self.assertFalse(ok, spec)
+            self.assertIn("/", msg)
+
+    def test_32gb_gates(self):
+        from fm3d import memguard
+        from fm3d.main import _validate_job_spec
+        orig = memguard.total_bytes
+        try:
+            memguard.total_bytes = lambda: 16 * 1024**3
+            ok, msg = _validate_job_spec({"pipeline_type": "512->1536"})
+            self.assertFalse(ok)
+            self.assertIn("/", msg)
+            ok, msg = _validate_job_spec({"texture_size": 4096})
+            self.assertFalse(ok)
+            ok, _ = _validate_job_spec({"texture_size": 2048,
+                                        "pipeline_type": "512->1024"})
+            self.assertTrue(ok)
+            memguard.total_bytes = lambda: 32 * 1024**3
+            ok, _ = _validate_job_spec({"texture_size": 2048,
+                                        "pipeline_type": "512->1536"})
+            self.assertTrue(ok)
+            ok, msg = _validate_job_spec({"texture_size": 4096,
+                                          "pipeline_type": "512->1536"})
+            self.assertFalse(ok)
+            self.assertIn("/", msg)
+            ok, msg = _validate_job_spec({"mv_resolution": 768})
+            self.assertFalse(ok)
+            self.assertIn("/", msg)
+            ok, _ = _validate_job_spec({"mv_resolution": 512})
+            self.assertTrue(ok)
+        finally:
+            memguard.total_bytes = orig
+
+    def test_worker_rejects_traversal_job_id(self):
+        import subprocess as _sp
+        import sys as _sys
+        r = _sp.run([_sys.executable, "-m", "fm3d.worker", "../x"],
+                    capture_output=True, text=True, cwd=str(SRC))
+        self.assertNotEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":

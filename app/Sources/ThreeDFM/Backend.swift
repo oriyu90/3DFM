@@ -26,11 +26,11 @@ final class Backend: ObservableObject {
             ?? jobs.first { $0.state == "queued" }
     }
     var statusLine: String {
-        if !serverUp { return needsSetup ? "未セットアップ" : "起動中…" }
+        if !serverUp { return needsSetup ? "未セットアップ / Not set up" : "起動中… / Starting…" }
         if let a = activeJob {
             return "\(a.name) — \(a.stage) \(Int(a.progress))%"
         }
-        return "待機中"
+        return "待機中 / Idle"
     }
 
     private var serverProc: Process?
@@ -85,7 +85,7 @@ final class Backend: ObservableObject {
             // Runtime not installed yet: the SetupWizard owns this path.
             // Do not spawn a doomed server with the system python.
             needsSetup = true
-            lastError = "ランタイム未導入: セットアップを実行してください"
+            lastError = "ランタイム未導入: セットアップを実行してください / Runtime not installed: run Setup"
             return
         }
         let proc = Process()
@@ -107,7 +107,7 @@ final class Backend: ObservableObject {
             try proc.run()
             serverProc = proc
         } catch {
-            lastError = "サーバーを起動できません: \(error.localizedDescription)"
+            lastError = "サーバーを起動できません: \(error.localizedDescription) / Cannot start server: \(error.localizedDescription)"
             return
         }
         Task { [weak self] in await self?.waitForHealth() }
@@ -117,7 +117,7 @@ final class Backend: ObservableObject {
         for p in 44931 ..< 44941 {
             if await ping(port: p) { return }
         }
-        lastError = "サーバーに接続できません。セットアップが必要です。"
+        lastError = "サーバーに接続できません。セットアップが必要です。 / Cannot reach server. Setup is required."
     }
 
     private func ping(port p: Int) async -> Bool {
@@ -176,8 +176,8 @@ final class Backend: ObservableObject {
     private func notifyTransitions(prev: [String: String], now: [Job]) {
         for j in now where j.state == "done" || j.state == "failed" {
             if prev[j.id] == "running" {
-                Notifier.shared.send(title: j.state == "done" ? "生成が完了しました" : "生成に失敗しました",
-                                     body: "\(j.name): \(j.state == "done" ? "成果物を確認できます" : j.error)")
+                Notifier.shared.send(title: j.state == "done" ? "生成が完了しました / Generation done" : "生成に失敗しました / Generation failed",
+                                     body: "\(j.name): \(j.state == "done" ? "成果物を確認できます / Check artifacts" : j.error)")
             }
         }
     }
@@ -256,7 +256,7 @@ final class Backend: ObservableObject {
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let s = String(data: data, encoding: .utf8) else {
-            return "モデル取得の開始に失敗しました"
+            return "モデル取得の開始に失敗しました / Failed to start fetching models"
         }
         return s
     }

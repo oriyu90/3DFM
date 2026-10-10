@@ -129,18 +129,57 @@ def _has_all(root: Path, files: set[str]) -> tuple[bool, list[str]]:
     return (not missing, missing)
 
 
+def _resolve_data_dir(mdir: Path, explicit: str) -> Path:
+    """Resolve the runtime root for the safetensors guard.
+
+    Precedence: explicit --data-dir > FM3D_DATA_DIR env > settings.json
+    `models_dir` back-reference > <models-dir>/.. (legacy default).
+    Never raises; falls back to the legacy default.
+    """
+    if explicit.strip():
+        return Path(explicit).expanduser()
+    try:
+        env = __import__("os").environ.get("FM3D_DATA_DIR", "").strip()
+        if env:
+            return Path(env).expanduser()
+    except Exception:
+        pass
+    # settings.json lives in <data>/settings.json; when models_dir points
+    # inside a custom data root we can recover it. Best-effort only.
+    try:
+        for cand in (mdir / ".." / "settings.json", mdir.parent / "settings.json"):
+            pass
+        # If mdir is <data>/models (default layout), parent is data.
+        # If mdir is custom, check whether <parent>/settings.json exists;
+        # otherwise fall back to parent (legacy behavior, documented).
+        if (mdir.parent / "settings.json").is_file():
+            return mdir.parent
+    except Exception:
+        pass
+    return Path(explicit).expanduser() if explicit.strip() else mdir.parent
+
+
 def _safetensors_everywhere(data_dir: Path) -> bool:
-    """True only if `import safetensors` works in trellis AND hun-human."""
+    """True only if `import safetensors` works in trellis AND hun-human.
+
+    When neither venv exists yet (fresh setup), return False so the
+    rmbg .bin duplicate is kept as fallback (safe default, never prune
+    aggressively on unknown state).
+    """
     import subprocess
+    found_any = False
     ok = True
     for venv in ("trellis", "hun-human"):
         py = data_dir / "venvs" / venv / "bin" / "python"
         if not py.exists():
             continue  # venv absent: its pipeline can't run anyway
+        found_any = True
         r = subprocess.run([str(py), "-c", "import safetensors"],
                            capture_output=True, timeout=60)
         if r.returncode != 0:
             ok = False
+    if not found_any:
+        return False
     return ok
 
 
@@ -156,7 +195,7 @@ def main() -> int:
     ns = ap.parse_args()
 
     mdir = Path(ns.models_dir).expanduser()
-    data = Path(ns.data_dir).expanduser() if ns.data_dir else mdir.parent
+    data = _resolve_data_dir(mdir, ns.data_dir)
     apply = bool(ns.apply)
 
     plans: dict[str, tuple[list[Path], list[Path]]] = {}

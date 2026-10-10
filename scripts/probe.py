@@ -66,11 +66,28 @@ def venv_probe(python: Path) -> dict:
                          " if hasattr(torch.backends,'mps') else False)"],
                         timeout=60)
         info["mps"] = (out == "True") if code == 0 else False
+        # SDPA availability (dense attention backend used on Mac).
+        code, out = run([str(python), "-c",
+                         "import torch; print(hasattr(torch.nn.functional,"
+                         "'scaled_dot_product_attention'))"],
+                        timeout=60)
+        info["sdpa"] = (out == "True") if code == 0 else False
     code, out = run([str(python), "-c", "import mlx; print('1')"], timeout=60)
     info["mlx"] = (code == 0)
-    for mod in ("mtlgemm", "mtldiffrast", "fast_simplification", "xatlas"):
+    # Metal-stack modules (real import names) + pure-python fallbacks.
+    for mod in ("flex_gemm", "fast_simplification", "xatlas",
+                "o_voxel", "trimesh", "scipy"):
         code, _ = run([str(python), "-c", f"import {mod}"], timeout=60)
         info[f"mod_{mod}"] = (code == 0)
+    # KDTree fallback probe (scipy, used when Metal bake is unavailable).
+    code, _ = run([str(python), "-c",
+                   "from scipy.spatial import cKDTree"], timeout=60)
+    info["mod_kdtree"] = (code == 0)
+    # Legacy names kept for backward compat with older probes.json readers.
+    for legacy, real in (("mod_mtlgemm", "mod_flex_gemm"),
+                         ("mod_mtldiffrast", "mod_o_voxel")):
+        if legacy not in info and real in info:
+            info[legacy] = info[real]
     return info
 
 
@@ -121,9 +138,17 @@ def main() -> int:
     if result["mem_total_gb"] > 0 and result["mem_total_gb"] < 16:
         warnings.append(f"only {result['mem_total_gb']} GiB memory; "
                         "16 GiB minimum, generation will be limited")
+    elif result["mem_total_gb"] > 0 and result["mem_total_gb"] < 32:
+        warnings.append(f"{result['mem_total_gb']} GiB memory: normal tier OK "
+                        "(512 / 512->1024 + 2048); 512->1536 and 4096 need "
+                        "32GB+")
     elif result["mem_total_gb"] > 0 and result["mem_total_gb"] < 40:
         warnings.append(f"{result['mem_total_gb']} GiB memory: normal tier OK; "
-                        "human/full prefers 40 GiB+ (auto-degraded guards apply)")
+                        "human/full prefers 40 GiB+ (auto-degraded guards apply); "
+                        "512->1536 + 4096 combo and MV 768px need 48GB+")
+    elif result["mem_total_gb"] >= 32:
+        # 32GB+ confirmation ( bilingual log via setup.sh; record is enough).
+        pass
     if result["disk_free_gb"] < 40:
         warnings.append(f"only {result['disk_free_gb']} GiB disk free; "
                         "full models need ~35 GiB (+runtimes/work ~25 GiB)")

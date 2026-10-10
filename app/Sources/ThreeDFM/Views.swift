@@ -20,10 +20,10 @@ struct JobsView: View {
             // HIG sidebars.md: familiar SF Symbols, accent default,
             // at most two levels, badges for counts.
             List(selection: $section) {
-                Label("キュー", systemImage: "tray.fill")
+                Label("キュー / Queue", systemImage: "tray.fill")
                     .tag(QueueSection.queue)
                     .badge(backend.queuedJobs.count)
-                Label("履歴", systemImage: "clock.fill")
+                Label("履歴 / History", systemImage: "clock.fill")
                     .tag(QueueSection.history)
                     .badge(backend.historyJobs.count)
             }
@@ -45,21 +45,21 @@ struct JobsView: View {
                 }
                 .padding(.vertical, 2)
             }
-            .navigationTitle(section == .history ? "履歴" : "キュー")
+            .navigationTitle(section == .history ? "履歴 / History" : "キュー / Queue")
             .navigationSubtitle(subtitle)
             .overlay {
                 if jobsInScope.isEmpty {
                     ContentUnavailableView {
-                        Label(section == .history ? "履歴は空です" : "キューは空です",
+                        Label(section == .history ? "履歴は空です / No history" : "キューは空です / Queue is empty",
                               systemImage: section == .history
                                 ? "clock.fill" : "tray.fill")
                     } description: {
                         Text(section == .history
-                            ? "完了した生成がここに表示されます"
-                            : "画像を選ぶと3Dモデルを生成できます")
+                            ? "完了した生成がここに表示されます / Finished jobs appear here"
+                            : "画像を選ぶと3Dモデルを生成できます / Pick images to generate 3D models")
                     } actions: {
                         if section != .history {
-                            Button("新規生成…") { backend.showNewJob = true }
+                            Button("新規生成… / New…") { backend.showNewJob = true }
                         }
                     }
                 }
@@ -68,34 +68,34 @@ struct JobsView: View {
             if let j = detail {
                 JobDetailView(job: j, logText: logText)
             } else {
-                ContentUnavailableView("ジョブを選択",
+                ContentUnavailableView("ジョブを選択 / Select a job",
                     systemImage: "cube.fill",
-                    description: Text("左の一覧から確認するジョブを選んでください"))
+                    description: Text("左の一覧から確認するジョブを選んでください / Pick a job from the list on the left"))
                     .foregroundStyle(.secondary)
             }
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button("新規生成", systemImage: "plus") {
+                Button("新規生成 / New", systemImage: "plus") {
                     backend.showNewJob = true
                 }
                 .keyboardShortcut("n", modifiers: .command)
             }
             ToolbarItem(placement: .principal) {
                 Picker("", selection: $filter) {
-                    Text("全て").tag("all")
-                    Text("実行中").tag("running")
-                    Text("待機").tag("queued")
-                    Text("完了").tag("done")
-                    Text("失敗").tag("failed")
-                    Text("取消").tag("cancelled")
+                    Text("全て / All").tag("all")
+                    Text("実行中 / Running").tag("running")
+                    Text("待機 / Queued").tag("queued")
+                    Text("完了 / Done").tag("done")
+                    Text("失敗 / Failed").tag("failed")
+                    Text("取消 / Cancelled").tag("cancelled")
                 }.pickerStyle(.segmented).labelsHidden()
             }
             // CLI parity: reorder is a first-class operation (POST /jobs/reorder).
             ToolbarItem(placement: .automatic) {
-                Menu("並び替え", systemImage: "arrow.up.arrow.down") {
-                    Button("選択を上へ") { moveSelection(by: -1) }
-                    Button("選択を下へ") { moveSelection(by: 1) }
+                Menu("並び替え / Reorder", systemImage: "arrow.up.arrow.down") {
+                    Button("選択を上へ / Move up") { moveSelection(by: -1) }
+                    Button("選択を下へ / Move down") { moveSelection(by: 1) }
                 }
                 .disabled(section != .queue || selection == nil)
             }
@@ -159,18 +159,18 @@ struct JobsView: View {
 
     private var subtitle: String {
         let n = jobsInScope.count
-        if section == .history { return "\(n)件の履歴" }
+        if section == .history { return "\(n)件の履歴 / \(n) history" }
         if let a = backend.activeJob { return "\(a.stage) \(Int(a.progress))%" }
-        return n == 0 ? "待機中" : "\(n)件待機中"
+        return n == 0 ? "待機中 / Idle" : "\(n)件待機中 / \(n) queued"
     }
 
     private func stateLabel(_ j: Job) -> String {
         switch j.state {
-        case "done": "完了"
-        case "running": "生成中"
-        case "failed": "失敗"
-        case "cancelled": "キャンセル済み"
-        default: "待機中"
+        case "done": "完了 / Done"
+        case "running": "生成中 / Running"
+        case "failed": "失敗 / Failed"
+        case "cancelled": "キャンセル済み / Cancelled"
+        default: "待機中 / Queued"
         }
     }
 
@@ -194,9 +194,9 @@ struct JobDetailView: View {
     @State private var notice = ""
 
     private var detailLine: String {
-        var s = "mode=\(job.mode) stage=\(job.stage) 進捗=\(Int(job.progress))%"
+        var s = "mode=\(job.mode) stage=\(job.stage) 進捗=\(Int(job.progress))% / progress=\(Int(job.progress))%"
         if let eta = job.eta_s {
-            s += String(format: " 残り約%.0fs", eta)
+            s += String(format: " 残り約%.0fs / ~%.0fs left", eta, eta)
         }
         return s
     }
@@ -217,30 +217,30 @@ struct JobDetailView: View {
             }
             HStack {
                 if job.state == "running" || job.state == "queued" {
-                    Button("キャンセル") {
+                    Button("キャンセル / Cancel") {
                         Task { await backend.cancel(id: job.id) }
                     }
                     if job.state == "running" {
-                        Button("強制終了") {
+                        Button("強制終了 / Force quit") {
                             Task { await backend.cancel(id: job.id, force: true) }
                         }
                     }
                 }
                 if job.state == "failed" || job.state == "cancelled"
                     || job.state == "done" {
-                    Button("再実行") {
+                    Button("再実行 / Retry") {
                         Task { await backend.retry(id: job.id) }
                     }
-                    Button("削除") {
+                    Button("削除 / Delete") {
                         busy = true
                         Task {
                             let ok = await backend.deleteHistory(id: job.id)
-                            notice = ok ? "削除しました" : "削除に失敗しました"
+                            notice = ok ? "削除しました / Deleted" : "削除に失敗しました / Delete failed"
                             busy = false
                         }
                     }.disabled(busy)
                 }
-                Button("フォルダを開く") { openJobDir() }
+                Button("フォルダを開く / Open folder") { openJobDir() }
                 Spacer()
             }
             if !notice.isEmpty {
@@ -248,20 +248,20 @@ struct JobDetailView: View {
             }
             // CLI parity: artifacts list + per-file download (GET /jobs/{id}/file).
             if !artifacts.isEmpty {
-                Text("成果物 (\(artifacts.count))").font(.headline)
+                Text("成果物 (\(artifacts.count)) / Artifacts").font(.headline)
                 ForEach(artifacts, id: \.path) { a in
                     HStack {
                         Text(a.path).font(.caption).lineLimit(1).truncationMode(.middle)
                         Spacer()
                         Text("\(a.size / 1024) KB").font(.caption).foregroundStyle(.secondary)
-                        Button("保存…") { saveArtifact(a) }
+                        Button("保存… / Save…") { saveArtifact(a) }
                             .font(.caption)
                     }
                 }
             }
-            Text("ログ").font(.headline)
+            Text("ログ / Log").font(.headline)
             ScrollView {
-                Text(logText.isEmpty ? "(ログなし)" : logText)
+                Text(logText.isEmpty ? "(ログなし / No log)" : logText)
                     .font(.system(.caption, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
@@ -281,7 +281,7 @@ struct JobDetailView: View {
     private func saveArtifact(_ a: Artifact) {
         Task {
             guard let data = await backend.artifactData(jobId: job.id, path: a.path) else {
-                notice = "ダウンロードに失敗: \(a.path)"
+                notice = "ダウンロードに失敗 / Download failed: \(a.path)"
                 return
             }
             let panel = NSSavePanel()
@@ -290,9 +290,9 @@ struct JobDetailView: View {
             if panel.runModal() == .OK, let url = panel.url {
                 do {
                     try data.write(to: url)
-                    notice = "保存しました: \(url.lastPathComponent)"
+                    notice = "保存しました / Saved: \(url.lastPathComponent)"
                 } catch {
-                    notice = "保存に失敗: \(error.localizedDescription)"
+                    notice = "保存に失敗 / Save failed: \(error.localizedDescription)"
                 }
             }
         }
@@ -349,15 +349,15 @@ struct SetupWizardView: View {
             }.pickerStyle(.segmented)
             Text("40GB+メモリのMacでは human/full を推奨。CLI `3dfm models ensure --tier human` と同一内容です。 / 40 GB+ Macs should use human/full. Same as CLI `3dfm models ensure --tier human`.")
                 .font(.caption).foregroundStyle(.secondary)
-            DisclosureGroup("Hugging Face トークン (ゲート付きモデル用・任意)") {
-                SecureField("hf_... (同意済みトークン)", text: $hfToken)
+            DisclosureGroup("Hugging Face トークン (ゲート付きモデル用・任意) / Hugging Face token (for gated models, optional)") {
+                SecureField("hf_... (同意済みトークン / consented token)", text: $hfToken)
                     .textFieldStyle(.roundedBorder)
-                Toggle("キーチェーンに保存 (次回以降も自動使用)", isOn: $rememberToken)
+                Toggle("キーチェーンに保存 (次回以降も自動使用) / Save to Keychain (auto-use next time)", isOn: $rememberToken)
                     .font(.callout)
-                Text("背景除去などのゲート付きモデルに必要です。トークンはHugging Faceで発行できます。利用規約の詳細は設定＞モデルで確認できます。")
+                Text("背景除去などのゲート付きモデルに必要です。トークンはHugging Faceで発行できます。利用規約の詳細は設定＞モデルで確認できます。 / Required for gated models such as background removal. Issue a token on Hugging Face. See Settings > Models for license details.")
                     .font(.caption).foregroundStyle(.secondary)
                 HStack(spacing: 12) {
-                    Link("トークン発行 (huggingface.co/settings/tokens)",
+                    Link("トークン発行 (huggingface.co/settings/tokens) / Get a token",
                          destination: URL(string: "https://huggingface.co/settings/tokens")!)
                 }.font(.caption)
             }.font(.callout)
@@ -514,9 +514,9 @@ final class SetupRunner: ObservableObject {
                 if proc.terminationStatus == 0 {
                     r.done = true
                     r.progress = 100
-                    r.phaseMsg = "完了"
+                    r.phaseMsg = "完了 / Done"
                 } else if r.failed.isEmpty {
-                    r.failed = "セットアップが異常終了しました (code \(proc.terminationStatus))。ログ: ~/Library/Application Support/3DFM/logs/setup.log"
+                    r.failed = "セットアップが異常終了しました (code \(proc.terminationStatus))。ログ: ~/Library/Application Support/3DFM/logs/setup.log / Setup failed (code \(proc.terminationStatus)). Log: ~/Library/Application Support/3DFM/logs/setup.log"
                 }
                 if SetupRunner.shared === r {
                     SetupRunner.shared = nil
@@ -591,38 +591,42 @@ struct GeneralSettingsPane: View {
 
     var body: some View {
         Form {
-            TextField("出力フォルダ:", text: $outputDir)
+            TextField("出力フォルダ: / Output folder:", text: $outputDir)
             HStack {
                 Spacer()
-                Button("選択…", action: pickDir)
+                Button("選択… / Choose…", action: pickDir)
             }
-            Picker("既定テクスチャ:", selection: $texture) {
+            Picker("既定テクスチャ: / Default texture:", selection: $texture) {
                 Text("1024").tag(1024)
                 Text("2048").tag(2048)
-                Text("4096").tag(4096)
+                Text("4096 (48GB+推奨 / 48GB+)").tag(4096)
             }.pickerStyle(.segmented)
-            Picker("既定パイプライン:", selection: $pipeline) {
-                Text("512 (速い)").tag("512")
-                Text("512→1024 (標準)").tag("512->1024")
-                Text("512→1536 (最高)").tag("512->1536")
+            Picker("既定パイプライン: / Default pipeline:", selection: $pipeline) {
+                Text("512 (速い / fast)").tag("512")
+                Text("512→1024 (標準 / standard)").tag("512->1024")
+                Text("512→1536 (最高 / best, 32GB+)").tag("512->1536")
             }
-            TextField("メモリ上限 RSS (GB):", text: $memCap)
-            TextField("開始に必要な空き (GB):", text: $memMinFree)
-            TextField("停滞タイムアウト (秒):", text: $stallTimeout)
-            TextField("キャンセル猶予 (秒):", text: $cancelGrace)
-            TextField("待機時GC間隔 (秒, 0=無効):", text: $idleGc)
-            TextField("履歴保持 (日, 0=無期限):", text: $retention)
-            TextField("ポート:", text: $port)
-            Toggle("完了通知", isOn: $notify)
-            Toggle("メニューバーに表示", isOn: $showMenuBarExtra)
+            if pipeline == "512->1536" && texture == 4096 {
+                Text("512→1536 + 4096は48GB+推奨です。32GBでは512→1024 + 2048を推奨。 / 512->1536 + 4096 prefers 48GB+. On 32GB use 512->1024 + 2048.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            TextField("メモリ上限 RSS (GB): / Memory cap RSS (GB):", text: $memCap)
+            TextField("開始に必要な空き (GB): / Free required to start (GB):", text: $memMinFree)
+            TextField("停滞タイムアウト (秒): / Stall timeout (s):", text: $stallTimeout)
+            TextField("キャンセル猶予 (秒): / Cancel grace (s):", text: $cancelGrace)
+            TextField("待機時GC間隔 (秒, 0=無効): / Idle GC interval (s, 0=off):", text: $idleGc)
+            TextField("履歴保持 (日, 0=無期限): / Retention (days, 0=forever):", text: $retention)
+            TextField("ポート: / Port:", text: $port)
+            Toggle("完了通知 / Notify on completion", isOn: $notify)
+            Toggle("メニューバーに表示 / Show in menu bar", isOn: $showMenuBarExtra)
             HStack {
-                Button("保存") { save() }
-                Button("再読込") { Task { await load() } }
+                Button("保存 / Save") { save() }
+                Button("再読込 / Reload") { Task { await load() } }
                 if !saved.isEmpty {
                     Text(saved).foregroundStyle(.secondary)
                 }
             }
-            Text("CLI `3dfm settings set` と同一キーです。")
+            Text("CLI `3dfm settings set` と同一キーです。 / Same keys as CLI `3dfm settings set`.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
@@ -877,12 +881,12 @@ struct ModelsSettingsPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // HIG onboarding.md: licensing details live here, not in setup.
-            Text("各モデルの利用規約への同意が必要な場合があります。ゲート付きモデルはHugging Faceで同意済みのトークンが必要です。")
+            Text("各モデルの利用規約への同意が必要な場合があります。ゲート付きモデルはHugging Faceで同意済みのトークンが必要です。 / Some models require license agreement. Gated models need a consented Hugging Face token.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack(spacing: 12) {
-                Link("DINOv3 利用規約",
+                Link("DINOv3 利用規約 / Terms",
                      destination: URL(string: "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m")!)
-                Link("RMBG-2.0 利用規約 (非商用)",
+                Link("RMBG-2.0 利用規約 (非商用 / non-commercial)",
                      destination: URL(string: "https://huggingface.co/briaai/RMBG-2.0")!)
             }.font(.callout)
             Divider()
@@ -892,7 +896,7 @@ struct ModelsSettingsPane: View {
                         .frame(width: 8, height: 8)
                     Text(m.id)
                     Spacer()
-                    Text(m.present ? String(format: "%.1f GB", m.size_gb) : "未導入")
+                    Text(m.present ? String(format: "%.1f GB", m.size_gb) : "未導入 / Missing")
                         .font(.caption).foregroundStyle(.secondary)
                 }.font(.callout)
             }
@@ -910,10 +914,10 @@ struct ModelsSettingsPane: View {
                 Text(ensureMsg).font(.caption).foregroundStyle(.secondary).lineLimit(3)
             }
             HStack {
-                Button("不足モデルを取得 (normal)") {
+                Button("不足モデルを取得 (normal) / Fetch missing (normal)") {
                     ensure(tier: "normal")
                 }.disabled(ensureBusy)
-                Button("人物込み (human)") {
+                Button("人物込み (human) / With human") {
                     ensure(tier: "human")
                 }.disabled(ensureBusy)
                 Spacer()
@@ -925,10 +929,10 @@ struct ModelsSettingsPane: View {
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
             HStack {
-                Text(hasToken ? "HFトークン: 登録済み" : "HFトークン: 未登録")
+                Text(hasToken ? "HFトークン: 登録済み / HF token: saved" : "HFトークン: 未登録 / HF token: not set")
                     .font(.callout).foregroundStyle(.secondary)
                 if hasToken {
-                    Button("クリア") {
+                    Button("クリア / Clear") {
                         HFTokenStore.delete()
                         hasToken = false
                     }
@@ -936,12 +940,12 @@ struct ModelsSettingsPane: View {
                 Spacer()
             }
             HStack {
-                Button("セットアップを再実行") {
+                Button("セットアップを再実行 / Re-run setup") {
                     NSApp.activate(ignoringOtherApps: true)
                     openWindow(id: "setup")
                 }
                 Spacer()
-                Button("データを開く") {
+                Button("データを開く / Open data") {
                     NSWorkspace.shared.open(Paths.dataDir)
                 }
             }
@@ -955,7 +959,7 @@ struct ModelsSettingsPane: View {
             models = st.models
             var r: [String: String] = [:]
             for (k, v) in st.runtimes ?? [:] {
-                r[k] = (v.present == true) ? "導入済み" : "未導入"
+                r[k] = (v.present == true) ? "導入済み / Installed" : "未導入 / Missing"
             }
             runtimes = r
         }
@@ -964,7 +968,7 @@ struct ModelsSettingsPane: View {
 
     private func ensure(tier: String) {
         ensureBusy = true
-        ensureMsg = "取得中… (\(tier))"
+        ensureMsg = "取得中… (\(tier)) / Fetching… (\(tier))"
         Task {
             let out = await backend.modelsEnsure(tier: tier)
             ensureMsg = String(out.prefix(800))

@@ -20,7 +20,10 @@ server + SQLite queue + CLI (`3dfm`) with full GUI=CLI parity.
 ## 動作環境 / Requirements
 
 - Apple Silicon (arm64), macOS 14+ (26+ 推奨 / recommended, Metal MSL 4.0)
-- メモリ 16GB最低 / 16 GB minimum, 24GB+推奨 / recommended, 40GB+快適 (人物 / human)
+- メモリ 16GB最低 / 16 GB minimum, 24GB+推奨 / recommended, 32GB+保証 / 32GB+ verified (v0.3.1), 40GB+快適 (人物 / human)
+  - 32GB+ の全Apple Silicon Macでセットアップ完走・通常生成を確認 / Verified setup + standard generation on all 32GB+ Apple Silicon Macs
+  - 512 / 512->1024 + 2048 + MV512 は全RAMで動作 / Standard settings work on all RAM sizes
+  - 512->1536 / 4096 は32GB+必須、1536+4096併用とMV768は48GB+必須 (不足時は日英422で案内、OOM前に拒否) / 1536/4096 need 32GB+, combo + MV768 need 48GB+ (bilingual 422, never OOM)
 - 空き容量: 普通 ~20GB / normal, 人物フル ~60GB / human-full (+作業領域 / work)
 
 ## 署名について / Signing (Rule 8)

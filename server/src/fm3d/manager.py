@@ -217,7 +217,7 @@ class JobManager:
     def cancel_job(self, job_id: str, force: bool = False) -> tuple[bool, str]:
         job = self.store.get(job_id)
         if not job:
-            return False, "not found"
+            return False, ("not found / 見つかりません")
         if job["state"] == "queued":
             self._remove_job_files(job_id)
             self.store.delete(job_id)
@@ -228,7 +228,8 @@ class JobManager:
             self._termed.discard(job_id)
             return True, "cancelled"
         if job["state"] != "running":
-            return False, f"job is {job['state']}"
+            return False, (f"job is {job['state']} / "
+                           f"ジョブは{job['state']}です")
         (self.dirs.job_dir(job_id) / "cancel.flag").touch(exist_ok=True)
         self._cancel_at[job_id] = time.time()
         if force:
@@ -244,9 +245,10 @@ class JobManager:
     def retry_job(self, job_id: str) -> tuple[Optional[str], str]:
         job = self.store.get(job_id)
         if not job:
-            return None, "not found"
+            return None, ("not found / 見つかりません")
         if job["state"] in ("queued", "running"):
-            return None, f"job is {job['state']}"
+            return None, (f"job is {job['state']} / "
+                           f"ジョブは{job['state']}です")
         src = self.dirs.job_dir(job_id)
         try:
             spec_rec = json.loads((src / "spec.json").read_text())
@@ -272,7 +274,8 @@ class JobManager:
                 job["name"], job["mode"], spec_rec.get("spec", {}),
                 job["seed"], staged), "queued"
         except OSError as e:
-            return None, f"cannot stage retry inputs: {e}"
+            return None, (f"cannot stage retry inputs: {e} / "
+                           f"再試行の入力を準備できません: {e}")
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 
@@ -594,16 +597,26 @@ class JobManager:
         low = tail.lower()
         if code == -9 or "signal 9" in low or "killed" in low.split()[-10:]:
             return ("worker killed by signal 9 (often the OS out-of-memory "
-                    "killer). Try a smaller pipeline/texture size. "
+                    "killer). Try a smaller pipeline/texture size. / "
+                    "ワーカーがシグナル9で終了しました（OSのメモリ不足キラーが"
+                    "原因のことが多いです）。パイプラインやテクスチャを小さく"
+                    "して再試行してください。 "
                     + tail[-2000:])
         if "out of memory" in low or "oom" in low:
-            return "worker out of memory. " + tail[-2000:]
+            return ("worker out of memory. Try 512 / 512->1024 + 2048, "
+                    "close other apps, or use a 48GB+ Mac for 1536/4096. / "
+                    "メモリ不足で終了しました。512 / 512->1024 + 2048を試すか、"
+                    "他のアプリを閉じるか、1536/4096には48GB以上のMacを"
+                    "使用してください。 " + tail[-2000:])
         if "empty mesh" in low or "empty-mesh" in low:
-            return ("empty mesh produced. Retry with a different seed. "
+            return ("empty mesh produced. Retry with a different seed. / "
+                    "空メッシュが生成されました。seedを変えて再試行してください。 "
                     + tail[-2000:])
         if code is None:
-            return "worker exited (unknown cause). " + tail[-2000:]
-        return f"worker exited with code {code}. " + tail[-2000:]
+            return ("worker exited (unknown cause). / "
+                    "ワーカーが終了しました（原因不明）。 " + tail[-2000:])
+        return (f"worker exited with code {code}. / "
+                f"ワーカーがコード{code}で終了しました。 " + tail[-2000:])
 
     def _finalize(self, jid: str, done=False, failed=False,
                   cancelled=False, error="") -> None:

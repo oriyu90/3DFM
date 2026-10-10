@@ -79,7 +79,9 @@ def models_root() -> Path:
 
 def require_dir(path: Path, hint: str) -> Path:
     if not path.is_dir():
-        raise RuntimeError(f"model not found: {path.name}. {hint}")
+        raise RuntimeError(
+            f"model not found: {path.name} at {path} "
+            f"({hint} / 不足モデル: {path} にありません。{hint})")
     return path
 
 
@@ -369,10 +371,12 @@ def _trellis_shape(ctx: Ctx, image_path: Path, spec: dict):
     os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
     try:
         import flex_gemm  # noqa: F401
-        os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+        os.environ["SPARSE_CONV_BACKEND"] = "flex_gemm"
         conv = "flex_gemm(metal)"
-    except (ImportError, RuntimeError):
-        os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
+    except (ImportError, RuntimeError, OSError):
+        # Must assign (not setdefault): the manager pre-seeds flex_gemm,
+        # so a failed import would otherwise leave a bogus value.
+        os.environ["SPARSE_CONV_BACKEND"] = "none"
         conv = "none(pure-pytorch)"
     for d in (str(t2), str(tm)):
         if d not in _sys.path:
@@ -473,7 +477,7 @@ def _bake_trellis(ctx: Ctx, tm: Path, mesh, verts, faces,
         backend = getattr(_ov.postprocess, "_BACKEND", None)
         has_dr = getattr(_ov.postprocess, "_HAS_DR", False)
         use_metal = backend == "metal" and has_dr
-    except (ImportError, AttributeError, RuntimeError):
+    except (ImportError, AttributeError, RuntimeError, OSError):
         use_metal = False
     if use_metal:
         try:
@@ -502,7 +506,7 @@ def _bake_trellis(ctx: Ctx, tm: Path, mesh, verts, faces,
             if not data:
                 raise RuntimeError("metal bake produced empty GLB")
             return data
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             ctx.progress("texture", 82.0, f"metal bake failed, KDTree: {e}")
             use_metal = False
     # KDTree fallback
@@ -661,7 +665,8 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
         raise RuntimeError(
             f"MV-Adapter import failed: {e}. Re-run Setup.") from e
     # diffusers>=0.40 removed enable_*_slicing; keep old call sites working.
-    # 64 GiB unified memory absorbs the unsliced VAE.
+    # On 32-48GB Macs unsliced VAE risks OOM, so prefer tiling/offload
+    # when available (best-effort, never fatal).
     for _m in ("enable_vae_slicing", "enable_attention_slicing"):
         if not hasattr(_MVPipe, _m):
             setattr(_MVPipe, _m, lambda self: None)
@@ -680,6 +685,14 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
         res = int(spec.get("mv_resolution", res))
     except (TypeError, ValueError):
         pass
+    # Memory safety: 32GB-class Macs must stay at 512px. The server-side
+    # submit validator rejects explicit 768px on <48GB, but clamp here as
+    # well so a stale client can never OOM the worker.
+    if total_b > 0 and total_b < 48 * 1024**3 and res > 512:
+        ctx.progress("mvadapter", 6.0,
+                     f"clamping mv_resolution {res}px -> 512px "
+                     f"(32GB-class memory safety)")
+        res = 512
     pipe = None
     try:
         with _Heartbeat(ctx, "mvadapter", 9.0,
@@ -688,6 +701,20 @@ def _run_mvadapter(ctx: Ctx, front: Path, outdir: Path,
                 base_model=str(base), vae_model=None, unet_model=None,
                 lora_model=None, adapter_path=str(adapter), scheduler=None,
                 num_views=6, device="mps", dtype=torch.float32)
+            # Memory safety on 32GB-class Macs: enable tiling / sequential
+            # offload when the pipeline supports it (best-effort).
+            if total_b > 0 and total_b < 48 * 1024**3:
+                for _opt in ("enable_vae_tiling",
+                             "enable_sequential_cpu_offload"):
+                    try:
+                        _fn = getattr(pipe, _opt, None)
+                        if callable(_fn):
+                            _fn()
+                            ctx.progress("mvadapter", 7.0,
+                                         f"memory-saver {_opt} enabled "
+                                         f"(32GB-class)")
+                    except Exception:
+                        pass
             images = run_pipeline(
                 pipe, num_views=6, text=str(spec.get("mv_prompt", "high quality")),
                 image=_PIL.open(front).convert("RGB"),

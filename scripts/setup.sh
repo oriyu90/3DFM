@@ -119,14 +119,19 @@ if [[ "$MACOS_MAJOR" -lt 14 ]]; then
 fi
 TOTAL_GB=$(python3 -c 'import subprocess; print(int(subprocess.run(["sysctl","-n","hw.memsize"],capture_output=True,text=True).stdout.strip())//1024**3)' 2>/dev/null || echo 0)
 log "total memory: ${TOTAL_GB}GB tier=$TIER"
+if [[ "$TOTAL_GB" -ge 32 ]]; then
+  log "32GB+ confirmed (${TOTAL_GB}GB): standard settings (512/512->1024 + 2048) fully supported; 512->1536 allowed, 1536+4096 combo and MV 768px need 48GB+ (server validates)"
+fi
 if [[ "$TIER" == "human" || "$TIER" == "full" ]]; then
   if [[ "$TOTAL_GB" -gt 0 && "$TOTAL_GB" -lt 40 ]]; then
     log "warn: tier=$TIER は40GB+推奨ですが ${TOTAL_GB}GB で続行します (自動低下ガードが作動します)"
   fi
 fi
 # Disk preflight: normal ~20GB, human/full ~60GB (models+runtimes+work).
+# tier=none installs no weights/runtimes, so it needs ~0GB.
 need_gb=20
 [[ "$TIER" == "human" || "$TIER" == "full" ]] && need_gb=60
+[[ "$TIER" == "none" ]] && need_gb=0
 free_gb=$(df -g "$DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
 log "disk free: ${free_gb}GB (need ~${need_gb}GB for tier=$TIER) data_dir=$DATA_DIR models_dir=$MODEL_DIR"
 if [[ "$free_gb" -gt 0 && "$free_gb" -lt "$need_gb" ]]; then
